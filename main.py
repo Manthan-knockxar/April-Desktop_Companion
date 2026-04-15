@@ -12,7 +12,7 @@ Runs 100% locally using llama3.2-vision via Ollama — no cloud API needed!
 Usage:
     python main.py
 
-Make sure Ollama is running with `gemma4:e4b` pulled!
+Make sure Ollama is running with `llama3.2-vision` pulled!
 """
 import sys
 import os
@@ -58,7 +58,7 @@ from context_memory import ContextMemory
 from tts_engine import init_tts, synthesize
 from audio_player import play_audio, stop as stop_audio
 from sprite_overlay import SpriteOverlay
-from system_info import get_system_context
+from system_info import get_system_context, get_enriched_context
 from logger import Log, PINK, CYAN, YELLOW, RED, GREEN, DIM, BOLD, RESET
 
 # Module loggers
@@ -257,9 +257,10 @@ def main():
 
             # Gather real-time system context (open apps, CPU, battery, etc.)
             with log_main.timed("System context gathering"):
-                system_context = get_system_context()
+                system_context, enriched_window = get_enriched_context()
             for line in system_context.split("\n"):
                 log_main.debug(f"System: {line}")
+            log_main.info(f"🎯 Activity: {enriched_window}")
 
             log_main.info(f"Memory state: affection={memory.affection}, streak={memory.roast_streak}, "
                           f"boredom={memory.similar_scene_streak}, total={memory.total_interactions}")
@@ -278,6 +279,7 @@ def main():
                 boredom_count=memory.similar_scene_streak,
                 accumulated_scenes=current_scenes,
                 system_context=system_context,
+                enriched_window=enriched_window,
             )
 
             if result is None:

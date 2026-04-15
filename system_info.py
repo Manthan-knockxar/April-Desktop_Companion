@@ -6,6 +6,7 @@ Gathers: active window, all open windows, CPU/RAM usage, battery,
 and a summary of running apps. Uses Win32 API via ctypes for
 window enumeration (zero extra dependencies) and psutil for stats.
 """
+import re
 import ctypes
 import ctypes.wintypes
 from collections import Counter
@@ -173,6 +174,153 @@ def get_system_stats() -> dict:
     return stats
 
 
+# ─── Window Title Enrichment ─────────────────────────────────
+
+def _parse_youtube_title(title: str) -> str:
+    """Extract video title from: '(1263) Video Title - YouTube - Google Chrome'"""
+    # Strip browser suffix
+    cleaned = re.sub(r'\s*-\s*Google Chrome$', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*-\s*Mozilla Firefox$', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*-\s*Microsoft Edge$', '', cleaned, flags=re.IGNORECASE)
+    # Strip " - YouTube" suffix
+    cleaned = re.sub(r'\s*-\s*YouTube$', '', cleaned, flags=re.IGNORECASE)
+    # Strip leading notification count like "(1263) "
+    cleaned = re.sub(r'^\(\d+\)\s*', '', cleaned)
+    return cleaned.strip()
+
+
+def _parse_generic_title(title: str) -> str:
+    """Extract meaningful part from generic browser titles."""
+    # Strip browser suffix
+    cleaned = re.sub(r'\s*-\s*(Google Chrome|Mozilla Firefox|Microsoft Edge|Opera|Brave)$', '', title, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _parse_editor_title(title: str) -> str:
+    """Extract filename from VS Code / editor titles."""
+    # VS Code: "filename.py - ProjectName - Visual Studio Code"
+    cleaned = re.sub(r'\s*-\s*Visual Studio Code$', '', title, flags=re.IGNORECASE)
+    # Take the first part (the filename)
+    parts = cleaned.split(' - ')
+    return parts[0].strip() if parts else cleaned.strip()
+
+
+def enrich_active_window(window_title: str) -> str:
+    """
+    Extract semantic content from the active window title.
+    Returns a human-readable sentence describing WHAT the user is doing,
+    not just WHICH app they are using.
+
+    This is the key insight: window titles already contain the content
+    description for free — we just need to parse and surface it.
+    """
+    if not window_title:
+        return "Desktop is idle or no active window"
+
+    title_lower = window_title.lower()
+
+    # ── YouTube ──
+    if "youtube" in title_lower:
+        video = _parse_youtube_title(window_title)
+        if video:
+            return f"Watching YouTube video: '{video}'"
+        return "Browsing YouTube"
+
+    # ── Netflix / Streaming ──
+    if "netflix" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Watching Netflix: '{content}'"
+
+    if "twitch" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Watching Twitch stream: '{content}'"
+
+    if "crunchyroll" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Watching anime on Crunchyroll: '{content}'"
+
+    # ── Spotify ──
+    if "spotify" in title_lower:
+        # Spotify title: "Song Name - Artist Name — Spotify"
+        cleaned = re.sub(r'\s*[—-]\s*Spotify.*$', '', window_title, flags=re.IGNORECASE)
+        if cleaned and cleaned.lower() != 'spotify':
+            return f"Listening to music: '{cleaned}'"
+        return "Browsing Spotify"
+
+    # ── Code Editors ──
+    if "visual studio code" in title_lower or "vscode" in title_lower:
+        filename = _parse_editor_title(window_title)
+        return f"Editing code file: '{filename}'"
+
+    if "dev-c++" in title_lower or "devcpp" in title_lower:
+        return f"Coding in Dev-C++: '{_parse_generic_title(window_title)}'"
+
+    if "pycharm" in title_lower:
+        return f"Coding in PyCharm: '{_parse_generic_title(window_title)}'"
+
+    if "intellij" in title_lower:
+        return f"Coding in IntelliJ: '{_parse_generic_title(window_title)}'"
+
+    # ── GitHub ──
+    if "github" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Browsing GitHub: '{content}'"
+
+    # ── StackOverflow ──
+    if "stack overflow" in title_lower or "stackoverflow" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Reading StackOverflow: '{content}'"
+
+    # ── Reddit ──
+    if "reddit" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Browsing Reddit: '{content}'"
+
+    # ── Twitter / X ──
+    if "twitter" in title_lower or "/ x" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Scrolling Twitter/X: '{content}'"
+
+    # ── Social / Chat ──
+    if "discord" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Chatting on Discord: '{content}'"
+
+    if "whatsapp" in title_lower:
+        return f"Using WhatsApp: '{_parse_generic_title(window_title)}'"
+
+    if "telegram" in title_lower:
+        return f"Using Telegram: '{_parse_generic_title(window_title)}'"
+
+    # ── Gaming ──
+    if "minecraft" in title_lower:
+        return "Playing Minecraft"
+
+    if "riot client" in title_lower or "valorant" in title_lower:
+        return "Playing Valorant"
+
+    if "league of legends" in title_lower:
+        return "Playing League of Legends"
+
+    if "steam" in title_lower:
+        content = _parse_generic_title(window_title)
+        return f"Using Steam: '{content}'"
+
+    # ── File Explorer ──
+    if "file explorer" in title_lower or "explorer" in title_lower:
+        return f"Browsing files: '{_parse_generic_title(window_title)}'"
+
+    # ── Fallback: generic browser tab ──
+    browser_suffixes = ["google chrome", "mozilla firefox", "microsoft edge", "opera", "brave"]
+    for browser in browser_suffixes:
+        if browser in title_lower:
+            content = _parse_generic_title(window_title)
+            return f"Browsing: '{content}'"
+
+    # ── Ultimate fallback ──
+    return f"Active window: '{window_title[:80]}'"
+
+
 # ─── Main Context Builder ────────────────────────────────────
 
 def get_system_context() -> str:
@@ -236,3 +384,16 @@ def get_system_context() -> str:
     except Exception as e:
         log.error("Failed to gather system context", exc=e)
         return f"(system info unavailable: {e})"
+
+
+def get_enriched_context() -> tuple[str, str]:
+    """
+    Returns (system_context, enriched_window) as a tuple.
+    - system_context: the full multi-line system context string
+    - enriched_window: a single semantic sentence about what the user is doing
+    """
+    system_context = get_system_context()
+    active = get_active_window_title()
+    enriched = enrich_active_window(active)
+    log.debug(f"Enriched window: {enriched}")
+    return system_context, enriched
