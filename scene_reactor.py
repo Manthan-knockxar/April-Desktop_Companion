@@ -300,6 +300,20 @@ REACTION: [React to the boring empty screen]"""
     # Parse the structured response
     result = _parse_response(text)
     if result:
+        # ── Hard duplicate check: reject if too similar to recent dialogue ──
+        new_dialogue = result["dialogue"].lower()
+        new_words = set(new_dialogue.split())
+        for prev in _recent_dialogues:
+            prev_words = set(prev.lower().split())
+            if len(new_words) > 3 and len(prev_words) > 3:
+                overlap = len(new_words & prev_words) / max(len(new_words), 1)
+                if overlap > 0.6:
+                    log.warn(f"Rejected duplicate dialogue ({overlap:.0%} overlap with recent): "
+                             f"\"{result['dialogue'][:60]}...\"")
+                    result = None
+                    break
+
+    if result:
         log.success(f"Reaction — emotion={result['emotion']}, "
                      f"action={result['action_type']}, dialogue_len={len(result['dialogue'])}")
         # Track dialogue for anti-repetition
@@ -370,11 +384,19 @@ def _parse_response(text: str) -> dict | None:
     
     if emotion_m:
         raw = emotion_m.group(1)
-        parsed = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
-        if parsed in valid_emotions:
-            emotion = parsed
+        cleaned = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
+        # Model sometimes writes "I'm smug" or dumps dialogue — extract just the emotion word
+        for emo in valid_emotions:
+            if emo in cleaned.split():
+                emotion = emo
+                break
         else:
-            log.debug(f"Invalid emotion '{parsed}', defaulting to 'neutral'")
+            # Try the first word only
+            first_word = cleaned.split()[0] if cleaned.split() else ''
+            if first_word in valid_emotions:
+                emotion = first_word
+            else:
+                log.debug(f"Invalid emotion '{cleaned}', defaulting to 'neutral'")
             
     if action_m:
         raw = action_m.group(1)
@@ -389,6 +411,10 @@ def _parse_response(text: str) -> dict | None:
         # Clean stray quotes that might have been stranded due to stripping
         if reaction.startswith('"') and reaction.endswith('"'):
             reaction = reaction[1:-1]
+        # Strip markdown formatting that sounds terrible in TTS
+        reaction = reaction.replace('**', '').replace('__', '')
+        reaction = reaction.replace('*', '').replace('_', '')
+        reaction = reaction.strip()
 
     if not scene or not reaction or reaction.lower() == "none":
         log.warn("Parse failed — no usable reaction text")
