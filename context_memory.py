@@ -123,11 +123,11 @@ class ContextMemory:
                 # New scene! Always react
                 return True
 
-            # Similar scene — allow 2-3 reactions then go quiet
-            if self.similar_scene_streak <= 3:
-                return self.cycles_since_last_reaction >= 2
+            # Similar scene — allow 5 reactions then start throttling
+            if self.similar_scene_streak <= 5:
+                return True
 
-            # After 3 similar reactions, only react every 5 cycles
-            return self.cycles_since_last_reaction >= 5
+            # After 5 similar reactions, only react every 3 cycles
+            return self.cycles_since_last_reaction >= 3
 
         return True

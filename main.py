@@ -156,6 +156,10 @@ def _scene_is_similar(scene: str, previous_scene: str, threshold: float = 0.5) -
         "their", "they", "user", "full", "visible", "nearby",
         "no", "not", "appears", "to", "be", "of", "has", "have",
         "several", "some", "there", "currently", "screen", "window",
+        # Content-type words that inflate similarity when watching same content
+        "watching", "anime", "video", "playing", "browsing", "streaming",
+        "computer", "person", "show", "episode", "game", "called",
+        "youtube", "chrome", "website", "browser",
     }
 
     def extract_keys(text):
@@ -265,8 +269,8 @@ def main():
             log_main.info(f"Memory state: affection={memory.affection}, streak={memory.roast_streak}, "
                           f"boredom={memory.similar_scene_streak}, total={memory.total_interactions}")
 
-            # Boredom suppression check
-            is_similar_now = memory.similar_scene_streak > 0
+            # Boredom suppression check — only suppress after 3+ genuinely stale scenes
+            is_similar_now = memory.similar_scene_streak >= 3
             if not memory.should_react(action_type=memory.last_reaction_label, scene_is_similar=is_similar_now):
                 log_main.debug("Skipping reaction — boredom suppression active")
                 time.sleep(config.REACT_INTERVAL)
