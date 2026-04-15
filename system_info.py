@@ -223,17 +223,17 @@ def enrich_active_window(window_title: str) -> str:
     if "youtube" in title_lower:
         video = _parse_youtube_title(window_title)
         if video:
-            return f"Watching YouTube video: '{video}'"
-        return "Browsing YouTube"
+            return f"Watching someone else's YouTube video titled: '{video}' (the user is a VIEWER, not the creator or player)"
+        return "Browsing YouTube homepage"
 
     # ── Netflix / Streaming ──
     if "netflix" in title_lower:
         content = _parse_generic_title(window_title)
-        return f"Watching Netflix: '{content}'"
+        return f"Watching a show/movie on Netflix: '{content}'"
 
     if "twitch" in title_lower:
         content = _parse_generic_title(window_title)
-        return f"Watching Twitch stream: '{content}'"
+        return f"Watching someone's Twitch livestream: '{content}'"
 
     if "crunchyroll" in title_lower:
         content = _parse_generic_title(window_title)
