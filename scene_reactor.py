@@ -345,10 +345,10 @@ def _parse_response(text: str) -> dict | None:
     valid_actions = {"commentary", "roast", "impressed", "concerned", "bored"}
 
     # Use regex to handle potential markdown bolding (**SCENE:**)
-    scene_m = re.search(r'[\*#]*SCENE[\*#]*:\s*(.*?)(?=\n\s*[\*#]*EMOTION|\Z)', text, re.IGNORECASE | re.DOTALL)
-    emotion_m = re.search(r'[\*#]*EMOTION[\*#]*:\s*([^\n]+)', text, re.IGNORECASE)
-    action_m = re.search(r'[\*#]*ACTION[\*#]*:\s*([^\n]+)', text, re.IGNORECASE)
-    react_m = re.search(r'[\*#]*REACTION[\*#]*:\s*(.*?)(?=\n\s*(?:I hope|Let me|Here is|Note:)|\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
+    scene_m = re.search(r'\*{0,2}SCENE\*{0,2}:\s*(.*?)(?=\n\s*\*{0,2}EMOTION|\Z)', text, re.IGNORECASE | re.DOTALL)
+    emotion_m = re.search(r'\*{0,2}EMOTION\*{0,2}:\s*([^\n]+)', text, re.IGNORECASE)
+    action_m = re.search(r'\*{0,2}ACTION\*{0,2}:\s*([^\n]+)', text, re.IGNORECASE)
+    react_m = re.search(r'\*{0,2}REACTION\*{0,2}:\s*(.*?)(?=\n\s*(?:I hope|Let me|Here is|Note:)|\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
 
     if scene_m:
         scene = scene_m.group(1).strip().strip('"\'*')

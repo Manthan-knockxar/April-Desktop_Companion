@@ -250,10 +250,9 @@ def main():
             # ── Step 2: Full reaction cycle ──
             log_main.info(f"═══ Reaction #{reaction_count} ═══")
 
-            # Get thread-safe copy of accumulated scenes, then clear the original
+            # Get thread-safe copy of accumulated scenes (do NOT clear yet)
             with _accumulated_lock:
                 current_scenes = list(_accumulated_scenes)
-                _accumulated_scenes.clear()
             log_main.debug(f"Consumed {len(current_scenes)} accumulated scenes")
 
             # Gather real-time system context (open apps, CPU, battery, etc.)
@@ -264,6 +263,13 @@ def main():
 
             log_main.info(f"Memory state: affection={memory.affection}, streak={memory.roast_streak}, "
                           f"boredom={memory.similar_scene_streak}, total={memory.total_interactions}")
+
+            # Boredom suppression check
+            is_similar_now = memory.similar_scene_streak > 0
+            if not memory.should_react(action_type=memory.last_reaction_label, scene_is_similar=is_similar_now):
+                log_main.debug("Skipping reaction — boredom suppression active")
+                time.sleep(config.REACT_INTERVAL)
+                continue
 
             result = analyze_and_react(
                 image=image,
@@ -287,6 +293,11 @@ def main():
                 continue
 
             consecutive_failures = 0
+            
+            # Reaction succeeded, safe to clear the copied context buffer
+            with _accumulated_lock:
+                _accumulated_scenes.clear()
+
             scene = result["scene"]
             dialogue = result["dialogue"]
             emotion = result.get("emotion", "neutral")

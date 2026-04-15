@@ -180,7 +180,10 @@ def _speak_edge_tts(text: str) -> bytes | None:
         try:
             log.debug(f"edge-tts: attempt {attempt + 1}/3")
             with log.timed(f"edge-tts synthesis (attempt {attempt + 1})"):
-                result = asyncio.run(_speak_edge_tts_async(text))
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(_speak_edge_tts_async(text))
+                loop.close()
             if result:
                 return result
             if attempt < 2:
