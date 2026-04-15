@@ -27,8 +27,8 @@ FRAME_DIFF_THRESHOLD = 0.03   # minimum % pixel change to consider "activity"
 SKIP_UNCHANGED_FRAMES = True  # skip inference if frame barely changed
 
 # ─── Image Downscale (Performance) ───────────────────────────
-DOWNSCALE_WIDTH = 512         # resize screenshots before sending to model
-DOWNSCALE_HEIGHT = 288        # (saves VRAM, faster inference)
+DOWNSCALE_WIDTH = 768         # resize screenshots before sending to model
+DOWNSCALE_HEIGHT = 432        # (saves VRAM, faster inference — 768x432 balances quality vs speed)
 
 # ─── VOICEVOX TTS (Fallback) ─────────────────────────────────
 VOICEVOX_URL = "http://localhost:50021"

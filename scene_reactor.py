@@ -369,14 +369,16 @@ def _parse_response(text: str) -> dict | None:
         scene = scene_m.group(1).strip().strip('"\'*')
     
     if emotion_m:
-        parsed = emotion_m.group(1).strip().strip('"\'*').lower()
+        raw = emotion_m.group(1)
+        parsed = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
         if parsed in valid_emotions:
             emotion = parsed
         else:
             log.debug(f"Invalid emotion '{parsed}', defaulting to 'neutral'")
             
     if action_m:
-        parsed = action_m.group(1).strip().strip('"\'*').lower()
+        raw = action_m.group(1)
+        parsed = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
         if parsed in valid_actions:
             action_type = parsed
         else:

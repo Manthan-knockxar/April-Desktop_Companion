@@ -239,6 +239,12 @@ def enrich_active_window(window_title: str) -> str:
         content = _parse_generic_title(window_title)
         return f"Watching anime on Crunchyroll: '{content}'"
 
+    if "animekai" in title_lower or "animepah" in title_lower or "gogoanime" in title_lower or "9anime" in title_lower or "zoro" in title_lower or "aniwatch" in title_lower:
+        content = _parse_generic_title(window_title)
+        # Try to extract the anime name from the page title
+        anime_name = content.split(" - ")[0].replace("Anime ", "").replace("Watch Online Free", "").strip()
+        return f"Watching anime: '{anime_name}' (the user is streaming anime, react to the anime content/genre visible on screen)"
+
     # ── Spotify ──
     if "spotify" in title_lower:
         # Spotify title: "Song Name - Artist Name — Spotify"
