@@ -1,0 +1,25 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Models and Data
+models/
+Asuka Voice Reference/
+NoranekoGames_Sabrina_BasePack.zip
+*.onnx
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# OS Cache
+.DS_Store
+Thumbs.db
