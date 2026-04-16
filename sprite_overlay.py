@@ -62,6 +62,7 @@ class SpriteOverlay:
         self._chat_button = None
         self._chat_visible = False
         self._pending_question = None  # user question for main.py to pick up
+        self._question_callback = None  # called when a question is submitted
 
     def start(self):
         """Start the overlay in a background thread."""
@@ -454,6 +455,10 @@ class SpriteOverlay:
             self._pending_question = None
         return q
 
+    def set_question_callback(self, callback):
+        """Set a callback to be invoked when a user question is submitted."""
+        self._question_callback = callback
+
     def stop(self):
         """Stop the overlay."""
         self._running = False
@@ -489,6 +494,10 @@ class SpriteOverlay:
 
         # Store question for main.py to pick up
         self._pending_question = question
+        
+        # Signal the main loop to wake up and process the question
+        if self._question_callback:
+            self._question_callback()
 
         # Clear entry and hide chat
         self._chat_entry.delete(0, tk.END)

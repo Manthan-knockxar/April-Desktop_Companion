@@ -105,6 +105,7 @@ def _tts_worker(dialogue: str, action_type: str):
 
 _accumulated_scenes: list[str] = []
 _accumulated_lock = threading.Lock()
+_question_event = threading.Event()  # signaled when a user question arrives
 
 def _context_worker():
     """
@@ -202,6 +203,18 @@ def main():
             print(f"  Run: {BOLD}ollama pull {config.OLLAMA_MODEL}{RESET}")
             sys.exit(1)
         log_main.success(f"Ollama connected — model '{config.OLLAMA_MODEL}' ready")
+        
+        # Warm-up inference to pre-load model weights (avoids 30s cold start)
+        log_main.info("Warming up model (first inference)...")
+        try:
+            ollama.chat(
+                model=config.OLLAMA_MODEL,
+                messages=[{"role": "user", "content": "Say hi in 3 words."}],
+                options={"num_predict": 10, "num_ctx": 256},
+            )
+            log_main.success("Model warmed up")
+        except Exception:
+            log_main.warn("Warm-up failed (non-fatal) — first reaction may be slow")
     except Exception as e:
         log_main.error(f"Cannot connect to Ollama at {config.OLLAMA_BASE_URL}")
         log_main.error(f"  Error: {e}")
@@ -218,6 +231,7 @@ def main():
         log_main.info("Initializing sprite overlay...")
         overlay = SpriteOverlay()
         overlay.start()
+        overlay.set_question_callback(lambda: _question_event.set())
         log_main.success("Sprite overlay started (always visible, bottom-right corner)")
 
     memory = ContextMemory()
@@ -360,19 +374,23 @@ def main():
 
 def _wait_and_poll(overlay, memory):
     """
-    Wait for REACT_INTERVAL seconds, but check for user questions every 0.5s.
-    If a question comes in, process it immediately, then reset the timer
-    so the next auto-reaction doesn't fire right after.
+    Wait for REACT_INTERVAL seconds, using an Event for efficient sleep.
+    If a question comes in (via the event), process it immediately,
+    then reset the timer so the next auto-reaction doesn't fire right after.
     """
-    wait_end = time.time() + config.REACT_INTERVAL
-    while time.time() < wait_end:
-        if overlay:
+    remaining = config.REACT_INTERVAL
+    while remaining > 0:
+        _question_event.clear()
+        # Wait efficiently — wakes up on question event OR timeout
+        triggered = _question_event.wait(timeout=remaining)
+        if triggered and overlay:
             question = overlay.get_pending_question()
             if question:
                 _handle_user_question(question, overlay, memory)
-                # Reset timer — don't auto-react right after answering a question
-                wait_end = time.time() + config.REACT_INTERVAL
-        time.sleep(0.5)
+                # Reset timer after answering
+                remaining = config.REACT_INTERVAL
+                continue
+        break
 
 
 def _handle_user_question(question: str, overlay, memory):

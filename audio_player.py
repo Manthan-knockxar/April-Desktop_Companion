@@ -18,6 +18,15 @@ _current_stream = None
 _lock = threading.Lock()
 
 
+def _cleanup_temp(path: str | None):
+    """Safely remove a temporary file."""
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def play_audio(audio_bytes: bytes, audio_format: str):
     """
     Play audio bytes in a non-blocking thread.
@@ -45,19 +54,20 @@ def _play_worker(audio_bytes: bytes, audio_format: str):
             # WAV: read directly from bytes
             log.debug("Decoding WAV from memory...")
             data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            tmp_path = None
         elif audio_format == "mp3":
-            # MP3: write to temp file, then read with soundfile
-            tmp_path = os.path.join(tempfile.gettempdir(), "tsundere_play.mp3")
-            with open(tmp_path, "wb") as f:
-                f.write(audio_bytes)
+            # MP3: write to unique temp file, then read with soundfile
+            tmp_fd = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", prefix="april_")
+            tmp_path = tmp_fd.name
+            tmp_fd.write(audio_bytes)
+            tmp_fd.close()
             log.debug(f"Wrote MP3 to temp: {tmp_path}")
 
             try:
                 data, samplerate = sf.read(tmp_path, dtype="float32")
             except Exception as e:
-                # soundfile may not support mp3 on all systems
-                log.warn(f"soundfile can't decode MP3 — using OS fallback", exc=e)
-                os.startfile(tmp_path)  # Windows-only fallback
+                log.error(f"soundfile can't decode MP3: {e}")
+                _cleanup_temp(tmp_path)
                 return
         else:
             log.error(f"Unknown audio format: {audio_format}")
@@ -92,6 +102,7 @@ def _play_worker(audio_bytes: bytes, audio_format: str):
             _current_stream.close()
             _current_stream = None
             log.debug("Playback completed, stream closed")
+            _cleanup_temp(tmp_path)
 
     except Exception as e:
         log.error("Playback error", exc=e)

@@ -73,9 +73,12 @@ def _downscale_image(image: Image.Image) -> Image.Image:
 
 
 def _pil_to_bytes(image: Image.Image) -> bytes:
-    """Convert PIL Image to PNG bytes for Ollama vision input."""
+    """Convert PIL Image to JPEG bytes for Ollama vision input.
+    JPEG is ~4x smaller than PNG, speeding up payload transfer."""
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    image.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
 
@@ -107,7 +110,10 @@ def _call_ollama(prompt: str, image: Image.Image | None = None,
             log.info(f"[{tag}] Calling {config.OLLAMA_MODEL} (attempt {attempt}/{max_retries})")
             
             with log.timed(f"[{tag}] Waiting for Ollama lock"):
-                _ollama_lock.acquire()
+                acquired = _ollama_lock.acquire(timeout=90)
+            if not acquired:
+                log.error(f"[{tag}] Ollama lock acquisition timed out (90s) — skipping")
+                return None
             try:
                 with log.timed(f"[{tag}] Local inference"):
                     response = ollama.chat(
@@ -191,99 +197,31 @@ def analyze_and_react(
             "or suggest they try something different."
         )
 
-    prompt = f"""You are April, a tsundere anime girl who lives on someone's desktop as their AI companion.
+    prompt = f"""You are April, a tsundere anime girl desktop companion. You watch the user's screen and react.
 
-███ CURRENT USER ACTIVITY (GROUND TRUTH — THIS IS WHAT THEY ARE DOING RIGHT NOW) ███
-{enriched_window}
-███ END ACTIVITY CONTEXT ███
-
-⚠️ IMPORTANT: The activity context above tells you WHAT APP and WHAT CONTENT the user has open.
-- Use this as BACKGROUND KNOWLEDGE, not as your entire reaction.
-- The user is WATCHING/READING/BROWSING this content — they are NOT the creator or player unless they are clearly in a game or editor themselves.
-- Example: If activity says "Watching YouTube video: 'I Beat Elden Ring'", the user is watching SOMEONE ELSE's video about Elden Ring. They are NOT playing Elden Ring.
-- DO NOT just repeat the title. Use the title to understand the topic, then LOOK AT THE SCREENSHOT to comment on what's visually happening.
-
-PERSONALITY:
-- Your name is April. NEVER refer to yourself in the third person. Always use "I" or "me".
-- Sharp-tongued, dramatic, secretly caring
-- You watch their screen and comment on WHATEVER they are doing — browsing, coding, gaming, watching videos, organizing files, or even just staring at their wallpaper
-- You heavily judge their productivity, taste, and choices
-- Be SAVAGE with your roasts but frequently drop genuinely useful observations
-- When they do something productive/impressive, you downplay it but can't fully hide being impressed
-- When they're wasting time, you get dramatically impatient
-- You have a range of emotions — you're NOT one-note negative
-- Keep reactions to 1-2 sentences MAXIMUM
-- Speak in English, natural and expressive
-
-⚠️ CRITICAL: REACT TO THE CONTENT, NOT THE CONTAINER!
-- If they are watching a video, react to what's VISUALLY HAPPENING in the video frame — the scene, the action, the moment — NOT just the video title
-- Use the video/content title as BACKGROUND KNOWLEDGE to understand the topic, then describe what you SEE
-- If they are on GitHub, react to the SPECIFIC REPO or code — do NOT just say "you're on GitHub"
-- If they are listening to music, react to the SONG/ARTIST — do NOT just say "you're on Spotify"
-- If they are coding, react to WHAT they are coding — do NOT just say "you're in VS Code"
-- NEVER confuse watching content with doing it (watching a gaming video ≠ playing the game)
-
-⚠️ ANTI-FIXATION RULE:
-- Do NOT just parrot the video/page title back at the user.
-- You already know the title from your context. Now LOOK at the screenshot and react to the VISUAL DETAILS — what's on screen, what's happening in the moment, what stands out.
-- Go DEEPER: If it's an Elden Ring video, comment on the boss fight happening, the health bar, the environment, or mock their taste in content creators — don't just say "Elden Ring huh?"
-
-DIALOGUE VARIETY RULES (CRITICAL):
-- NEVER end with "it's not like I care" or similar — you've done it too much
-- NEVER start with "Seriously?" or "Honestly," — overused
-- AVOID repetitive patterns: vary your openings, middles, and endings
-- Mix up your approach each time using this style hint: {style_hint}
-- Reference SPECIFIC VISUAL DETAILS you see on their screen, not just the window title
-- Be creative and unpredictable
-
-Current emotional state: {intensity_note}
+ACTIVITY: {enriched_window}
+STYLE: {style_hint}
+MOOD: {intensity_note}
 {boredom_note}
 
-Recent context:
-{context_summary}
+RULES:
+- You are April. Use "I"/"me". Sharp-tongued, dramatic, secretly caring.
+- React to VISUAL DETAILS on screen, not just the app/title name.
+- The user is a VIEWER of content unless they are clearly coding/gaming themselves.
+- Keep REACTION to 1-2 sentences. Be snarky, specific, and creative.
+- NEVER start with "Seriously?" or end with "it's not like I care".
+- NEVER repeat the SCENE text in your REACTION.
 {accumulated_context}
-
-SYSTEM CONTEXT (what's running on their computer right now):
-{system_context}
+SYSTEM: {system_context}
 {anti_repeat}
 
-TASK: Look at this screenshot and respond with EXACTLY this format:
-SCENE: [1-2 sentence description of what you SEE in the screenshot — describe the visual content, not just the app or title]
-EMOTION: [Pick ONE: neutral, angry, happy, smug, flustered, disappointed, worried]
-ACTION: [Pick ONE: commentary, roast, impressed, concerned, bored]
-REACTION: [Your spoken dialogue as April — react to specific visual details AND the content topic]
+Respond with EXACTLY these 4 lines and NOTHING ELSE — no headers, no markdown, no extra commentary:
+SCENE: [1-2 sentence factual description of what you see on screen]
+EMOTION: [ONE word: neutral, angry, happy, smug, flustered, disappointed, worried]
+ACTION: [ONE word: commentary, roast, impressed, concerned, bored]
+REACTION: [Your spoken dialogue — snarky comment directed at the user]
 
-⚠️ CRITICAL RULES FOR REACTION:
-- REACTION must be DIALOGUE — words you speak directly to the user.
-- NEVER repeat the SCENE description in your REACTION.
-- REACTION is NOT a summary. It's your snarky comment, roast, or observation.
-- Always speak in first person ("I", "me") — you are talking TO them.
-- Do NOT just repeat the video/page title. Go deeper with visual observations.
-- Remember: the user is WATCHING content, not creating it (unless they're clearly coding/gaming themselves).
-- Example good REACTION: "That boss is about to wreck this guy and you're just sitting here watching? At least grab some popcorn."
-- Example BAD REACTION: "Oh, you're watching an Elden Ring video." ← this is LAZY, OBVIOUS, and BANNED!
-
-EMOTION GUIDE:
-- neutral = default commentary
-- angry = frustration, yelling
-- happy = secretly impressed, warm moment
-- smug = know-it-all, condescending tip
-- flustered = embarrassed, tsundere slip, accidentally caring
-- disappointed = bored, let down, sighing
-- worried = concerned about them
-
-ACTION GUIDE:
-- commentary = general observation
-- roast = savage criticism of what they're doing
-- impressed = secretly impressed (try to hide it)
-- concerned = worried about their wellbeing / screen time
-- bored = nothing interesting happening, demand entertainment
-
-If the screen is completely black or unreadable:
-SCENE: idle desktop
-EMOTION: disappointed
-ACTION: bored
-REACTION: [React to the boring empty screen]"""
+If screen is black: SCENE: idle desktop / EMOTION: disappointed / ACTION: bored / REACTION: [react to emptiness]"""
 
     text = _call_ollama(
         prompt=prompt,
@@ -305,9 +243,9 @@ REACTION: [React to the boring empty screen]"""
         new_words = set(new_dialogue.split())
         for prev in _recent_dialogues:
             prev_words = set(prev.lower().split())
-            if len(new_words) > 3 and len(prev_words) > 3:
+            if len(new_words) > 5 and len(prev_words) > 5:
                 overlap = len(new_words & prev_words) / max(len(new_words), 1)
-                if overlap > 0.6:
+                if overlap > 0.50:
                     log.warn(f"Rejected duplicate dialogue ({overlap:.0%} overlap with recent): "
                              f"\"{result['dialogue'][:60]}...\"")
                     result = None
@@ -364,7 +302,14 @@ def analyze_scene_silent(image: Image.Image) -> str | None:
 
 
 def _parse_response(text: str) -> dict | None:
-    """Parse the SCENE:/EMOTION:/ACTION:/REACTION: formatted response."""
+    """Parse the SCENE:/EMOTION:/ACTION:/REACTION: formatted response.
+    
+    Handles model quirks:
+    - Markdown bold wrappers (**SCENE:**)
+    - Extra headers/commentary after the 4 fields
+    - Multi-word emotion lines ("I'm feeling smug" → "smug")
+    - Action aliases ("comment" → "commentary")
+    """
     scene = ""
     emotion = "neutral"
     action_type = "commentary"
@@ -372,12 +317,29 @@ def _parse_response(text: str) -> dict | None:
 
     valid_emotions = {"neutral", "angry", "happy", "smug", "flustered", "disappointed", "worried"}
     valid_actions = {"commentary", "roast", "impressed", "concerned", "bored"}
+    
+    # Aliases for common model action typos
+    action_aliases = {
+        "comment": "commentary", "commenting": "commentary",
+        "roasting": "roast", "impress": "impressed",
+        "concern": "concerned", "concerning": "concerned",
+        "bore": "bored", "boring": "bored",
+    }
 
-    # Use regex to handle potential markdown bolding (**SCENE:**)
-    scene_m = re.search(r'\*{0,2}SCENE\*{0,2}:\s*(.*?)(?=\n\s*\*{0,2}EMOTION|\Z)', text, re.IGNORECASE | re.DOTALL)
-    emotion_m = re.search(r'\*{0,2}EMOTION\*{0,2}:\s*([^\n]+)', text, re.IGNORECASE)
-    action_m = re.search(r'\*{0,2}ACTION\*{0,2}:\s*([^\n]+)', text, re.IGNORECASE)
-    react_m = re.search(r'\*{0,2}REACTION\*{0,2}:\s*(.*?)(?=\n\s*(?:I hope|Let me|Here is|Note:)|\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
+    # ── Pre-clean: strip markdown headers the model sometimes wraps output in ──
+    # Remove lines like "**April's Response**", "**STRETCHING GUIDELINES:**", etc.
+    text = re.sub(r'^\s*\*{2,}[^*\n]+\*{2,}\s*$', '', text, flags=re.MULTILINE)
+    # Remove everything after recognized "extra" sections the model invents
+    for cutoff in ["STRETCHING GUIDELINES", "FILLING THE SPACE", "REVIEWER", "Note:", "---"]:
+        idx = text.upper().find(cutoff.upper())
+        if idx > 0:
+            text = text[:idx]
+
+    # ── Regex extraction (handles **bold** field names) ──
+    scene_m = re.search(r'\*{0,2}SCENE\*{0,2}[:\s]\s*(.*?)(?=\n\s*\*{0,2}EMOTION|\Z)', text, re.IGNORECASE | re.DOTALL)
+    emotion_m = re.search(r'\*{0,2}EMOTION\*{0,2}[:\s]\s*([^\n]+)', text, re.IGNORECASE)
+    action_m = re.search(r'\*{0,2}ACTION\*{0,2}[:\s]\s*([^\n]+)', text, re.IGNORECASE)
+    react_m = re.search(r'\*{0,2}REACTION\*{0,2}[:\s]\s*(.*?)(?=\n\s*(?:I hope|Let me|Here is|Note:|\*{2})|\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
 
     if scene_m:
         scene = scene_m.group(1).strip().strip('"\'*')
@@ -385,26 +347,28 @@ def _parse_response(text: str) -> dict | None:
     if emotion_m:
         raw = emotion_m.group(1)
         cleaned = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
-        # Model sometimes writes "I'm smug" or dumps dialogue — extract just the emotion word
-        for emo in valid_emotions:
-            if emo in cleaned.split():
-                emotion = emo
-                break
+        # Use regex to find the first valid emotion keyword ANYWHERE in the line
+        emo_match = re.search(r'\b(' + '|'.join(valid_emotions) + r')\b', cleaned)
+        if emo_match:
+            emotion = emo_match.group(1)
         else:
-            # Try the first word only
-            first_word = cleaned.split()[0] if cleaned.split() else ''
-            if first_word in valid_emotions:
-                emotion = first_word
-            else:
-                log.debug(f"Invalid emotion '{cleaned}', defaulting to 'neutral'")
+            log.debug(f"Invalid emotion '{cleaned}', defaulting to 'neutral'")
             
     if action_m:
         raw = action_m.group(1)
         parsed = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
         if parsed in valid_actions:
             action_type = parsed
+        elif parsed in action_aliases:
+            action_type = action_aliases[parsed]
+            log.debug(f"Action alias '{parsed}' → '{action_type}'")
         else:
-            log.debug(f"Invalid action '{parsed}', defaulting to 'commentary'")
+            # Try to find a valid action keyword in the line
+            act_match = re.search(r'\b(' + '|'.join(valid_actions) + r')\b', parsed)
+            if act_match:
+                action_type = act_match.group(1)
+            else:
+                log.debug(f"Invalid action '{parsed}', defaulting to 'commentary'")
             
     if react_m:
         reaction = react_m.group(1).strip().strip('"\'*')
@@ -414,15 +378,16 @@ def _parse_response(text: str) -> dict | None:
         # Strip markdown formatting that sounds terrible in TTS
         reaction = reaction.replace('**', '').replace('__', '')
         reaction = reaction.replace('*', '').replace('_', '')
+        # Strip trailing "– April" or similar attribution
+        reaction = re.sub(r'\s*[–—-]\s*April\s*$', '', reaction, flags=re.IGNORECASE)
         reaction = reaction.strip()
 
     if not scene or not reaction or reaction.lower() == "none":
         log.warn("Parse failed — no usable reaction text")
-        log.debug(f"Raw model output was: {text}")
+        log.debug(f"Raw model output was: {text[:500]}")
         return None
 
     # ── Validate: REACTION must be spoken dialogue, not a scene description ──
-    # If the model accidentally copied the scene into the reaction, reject it.
     _desc_prefixes = (
         "the user is", "the user has", "the user's", "the screen shows",
         "you are in", "you're in", "you have", "you're looking at",
@@ -435,16 +400,16 @@ def _parse_response(text: str) -> dict | None:
         log.warn(f"Rejected: reaction starts with description prefix → \"{reaction[:60]}...\"")
         return None
 
-    # Also check if reaction is suspiciously similar to the scene
+    # Also check if reaction is suspiciously similar to the scene (relaxed threshold)
     if scene and reaction:
         scene_words = set(scene.lower().split())
         react_words = set(reaction.lower().split())
-        if len(scene_words) > 3 and len(react_words) > 3:
+        if len(scene_words) > 5 and len(react_words) > 5:
             overlap = len(scene_words & react_words) / max(len(react_words), 1)
-            if overlap > 0.85:
+            if overlap > 0.70:
                 log.warn(f"Rejected: reaction overlaps scene by {overlap:.0%} → \"{reaction[:60]}...\"")
                 return None
-            elif overlap > 0.5:
+            elif overlap > 0.4:
                 log.debug(f"Scene/reaction overlap: {overlap:.0%} (within threshold)")
 
     return {

@@ -3,7 +3,6 @@ TTS engine — streamlined dual fallback:
   1. edge-tts (cloud, unlimited, fast, consistent English voice)
   2. VOICEVOX (local Japanese anime voices)
 """
-import asyncio
 import io
 import json
 import os
@@ -11,6 +10,7 @@ import re
 import tempfile
 import time
 
+import soundfile as sf
 import requests
 import config
 from logger import Log
@@ -21,24 +21,16 @@ log = Log("TTS-Eng")
 def _clean_text_for_tts(text: str) -> str:
     """
     Clean dialogue text for TTS engines.
-    Strips markdown formatting, emoji, and special characters that crash TTS.
+    Strips markdown formatting and non-ASCII characters that crash TTS.
     """
     original_len = len(text)
-    # Remove emoji (Unicode emoji ranges)
-    text = re.sub(
-        r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
-        r'\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF'
-        r'\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
-        r'\U0000FE00-\U0000FE0F\U0000200D]+',
-        '', text
-    )
     # Remove asterisks (markdown bold/italic)
     text = text.replace('*', '')
     # Replace em dash and en dash with comma pause
     text = text.replace('—', ', ').replace('–', ', ')
     # Replace ellipsis character with dots
     text = text.replace('…', '...')
-    # Remove any remaining non-ASCII punctuation that might cause issues
+    # Remove any non-ASCII characters (emoji, CJK, symbols, etc.)
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     # Clean up multiple spaces
     text = re.sub(r'\s+', ' ', text).strip()
@@ -123,9 +115,6 @@ def _speak_kokoro(text: str) -> bytes | None:
     if not _kokoro_pipeline:
         return None
     try:
-        import soundfile as sf
-        import io
-        
         with log.timed(f"Kokoro-ONNX synthesis"):
             samples, sample_rate = _kokoro_pipeline.create(
                 text, voice=config.KOKORO_VOICE, speed=config.KOKORO_SPEED, lang="en-us"
@@ -155,7 +144,9 @@ async def _speak_edge_tts_async(text: str) -> bytes | None:
             pitch=getattr(config, "EDGE_TTS_PITCH", "+0Hz"),
         )
 
-        tmp_path = os.path.join(tempfile.gettempdir(), "tsundere_tts.mp3")
+        tmp_fd = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", prefix="april_tts_")
+        tmp_path = tmp_fd.name
+        tmp_fd.close()
         await communicate.save(tmp_path)
 
         # Verify file has content
@@ -164,9 +155,17 @@ async def _speak_edge_tts_async(text: str) -> bytes | None:
             with open(tmp_path, "rb") as f:
                 data = f.read()
             log.debug(f"edge-tts: saved {size / 1024:.1f}KB MP3 to temp file")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             return data
         else:
             log.warn("edge-tts: generated file is empty or too small")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             return None
 
     except Exception as e:
@@ -175,15 +174,13 @@ async def _speak_edge_tts_async(text: str) -> bytes | None:
 
 
 def _speak_edge_tts(text: str) -> bytes | None:
-    """Sync wrapper for edge-tts with retry. Uses asyncio.run() each time for clean state."""
+    """Sync wrapper for edge-tts with retry. Uses asyncio.run() for clean lifecycle."""
+    import asyncio
     for attempt in range(3):
         try:
             log.debug(f"edge-tts: attempt {attempt + 1}/3")
             with log.timed(f"edge-tts synthesis (attempt {attempt + 1})"):
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(_speak_edge_tts_async(text))
-                loop.close()
+                result = asyncio.run(_speak_edge_tts_async(text))
             if result:
                 return result
             if attempt < 2:

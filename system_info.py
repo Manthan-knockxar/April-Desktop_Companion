@@ -16,6 +16,12 @@ from logger import Log
 
 log = Log("SysInfo")
 
+# Prime psutil CPU counter at module load so subsequent calls are accurate
+try:
+    psutil.cpu_percent(interval=None)
+except Exception:
+    pass
+
 
 # ─── Win32 Window Enumeration ────────────────────────────────
 
@@ -25,6 +31,10 @@ _WNDENUMPROC = ctypes.WINFUNCTYPE(
     ctypes.wintypes.HWND,
     ctypes.wintypes.LPARAM,
 )
+
+# Window styles for filtering phantom UWP windows
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
 
 # Window titles to ignore (system/invisible windows)
 _IGNORE_TITLES = {
@@ -55,6 +65,19 @@ def get_all_visible_windows() -> list[str]:
     def _enum_callback(hwnd, _lparam):
         try:
             if ctypes.windll.user32.IsWindowVisible(hwnd):
+                # Filter out UWP phantom / tool windows
+                ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+                if ex_style & _WS_EX_TOOLWINDOW:
+                    return True
+                
+                # Filter out zero-size phantom windows
+                rect = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w <= 1 or h <= 1:
+                    return True
+                
                 length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
                 if length > 0:
                     buf = ctypes.create_unicode_buffer(length + 1)
@@ -62,8 +85,8 @@ def get_all_visible_windows() -> list[str]:
                     title = buf.value
                     if title and title not in _IGNORE_TITLES:
                         titles.append(title)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"EnumWindows callback error: {e}")
         return True
 
     try:
@@ -149,7 +172,7 @@ def get_system_stats() -> dict:
     """Get CPU, RAM, and battery info."""
     stats = {}
     try:
-        stats["cpu_percent"] = psutil.cpu_percent(interval=0)
+        stats["cpu_percent"] = psutil.cpu_percent(interval=None)
     except Exception:
         stats["cpu_percent"] = -1
 
