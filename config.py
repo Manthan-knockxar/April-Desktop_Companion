@@ -72,3 +72,16 @@ OVERLAY_DISPLAY_SECONDS = 8
 OVERLAY_BG_COLOR = "#1a1a2e"
 OVERLAY_TEXT_COLOR = "#ff6b9d"
 OVERLAY_NAME_COLOR = "#FFD700"  # gold for character name tab
+
+# ─── QOL / UX ────────────────────────────────────────────────
+POSITION_SAVE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "april_position.json",
+)
+TRAY_ENABLED = True               # system tray icon for show/hide/quit
+
+# ─── RVC Voice Conversion ────────────────────────────────────
+RVC_ENABLED = True
+RVC_SIDECAR_URL = "http://localhost:5055"
+RVC_PITCH_SHIFT = 0               # semitone pitch shift (0 for Ironmouse)
+RVC_TIMEOUT = 10                  # seconds to wait for conversion

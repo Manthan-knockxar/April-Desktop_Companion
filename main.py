@@ -20,6 +20,8 @@ import time
 import threading
 import ssl
 import ctypes
+import subprocess
+import atexit
 
 # ─── Force UTF-8 Console (Fixes cp1252 emoji crashes) ────────
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -79,16 +81,28 @@ BANNER = f"""
 
 # ─── Background TTS Worker ───────────────────────────────────
 
+_overlay_ref: SpriteOverlay | None = None  # set in main() for mute checks
+
 def _tts_worker(dialogue: str, action_type: str):
     """
     Synthesize and play audio in a background thread.
     This prevents TTS from blocking the main capture loop.
+    Respects overlay mute toggle — skips playback when muted.
     """
     try:
+        # Check mute state before synthesizing
+        if _overlay_ref and _overlay_ref.muted:
+            log_tts.info("Voice muted — skipping TTS")
+            return
+
         log_tts.info(f"Synthesizing: \"{dialogue[:60]}...\"")
         with log_tts.timed("TTS synthesis"):
             audio_bytes, audio_format = synthesize(dialogue, action_type=action_type)
         if audio_bytes:
+            # Re-check mute in case it changed during synthesis
+            if _overlay_ref and _overlay_ref.muted:
+                log_tts.info("Voice muted during synthesis — skipping playback")
+                return
             size_kb = len(audio_bytes) / 1024
             log_tts.success(f"Got {audio_format.upper()} audio — {size_kb:.1f}KB")
             log_tts.info("Playing audio...")
@@ -221,18 +235,44 @@ def main():
         print(f"  Make sure Ollama is running: {BOLD}ollama serve{RESET}")
         sys.exit(1)
 
+    # Start RVC Sidecar if enabled
+    rvc_process = None
+    if getattr(config, "RVC_ENABLED", False):
+        log_main.info("Starting RVC Sidecar (Python 3.10)...")
+        sidecar_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rvc_sidecar")
+        venv_python = os.path.join(sidecar_dir, "venv", "Scripts", "python.exe")
+        try:
+            if os.path.exists(venv_python):
+                rvc_process = subprocess.Popen(
+                    [venv_python, "server.py"],
+                    cwd=sidecar_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                atexit.register(lambda: rvc_process.terminate())
+                # Yield roughly 5 seconds for the heavy PyTorch model to load into GPU
+                log_main.debug("Waiting ~6s for RVC sidecar to warm up...")
+                time.sleep(6)
+            else:
+                log_main.warn("RVC enabled but Python 3.10 venv not found. Run setup_rvc.ps1 first.")
+        except Exception as e:
+            log_main.error(f"Failed to start RVC Sidecar: {e}")
+
     # Initialize systems
     log_main.info("Initializing TTS engine...")
     init_tts()
 
     # Initialize sprite overlay — always visible from the start
+    global _overlay_ref
     overlay = None
     if config.SPRITE_ENABLED or config.OVERLAY_ENABLED:
         log_main.info("Initializing sprite overlay...")
         overlay = SpriteOverlay()
         overlay.start()
         overlay.set_question_callback(lambda: _question_event.set())
-        log_main.success("Sprite overlay started (always visible, bottom-right corner)")
+        _overlay_ref = overlay  # expose for TTS mute checks
+        tray_status = "+ tray icon" if config.TRAY_ENABLED else "no tray"
+        log_main.success(f"Sprite overlay started (draggable, {tray_status})")
 
     memory = ContextMemory()
 

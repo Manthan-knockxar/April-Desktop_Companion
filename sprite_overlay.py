@@ -14,11 +14,19 @@ Features:
   - Lip-sync animation (toggles mouth open/closed during speech)
   - VN-style dialogue box with character name tab
   - Always-visible idle sprite (VTuber corner mode)
+  - Drag-to-reposition (sprite + chatbox move together)
+  - Position persistence across sessions
+  - Right-click context menu (reset pos, mute, click-through, quit)
+  - Double-click sprite to toggle chat
+  - System tray icon (show/hide, mute, quit)
+  - Click-through mode (transparent to mouse events)
 """
+import json
 import os
 import threading
+import ctypes
 import tkinter as tk
-from PIL import Image as PILImage, ImageTk
+from PIL import Image as PILImage, ImageTk, ImageDraw
 
 import config
 from emotion_mapper import get_sprite_expression, get_sprite_filename
@@ -28,6 +36,11 @@ from emotion_mapper import get_sprite_expression, get_sprite_filename
 # Using a dark near-black that won't be in the anime sprites.
 CHROMA_KEY = "#0D0E0F"
 CHROMA_KEY_RGB = (13, 14, 15)
+
+# Windows API constants for click-through
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_LAYERED = 0x00080000
 
 
 class SpriteOverlay:
@@ -63,6 +76,23 @@ class SpriteOverlay:
         self._chat_visible = False
         self._pending_question = None  # user question for main.py to pick up
         self._question_callback = None  # called when a question is submitted
+
+        # ─── QOL state ────────────────────────────────────────
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+        self._user_positioned = False   # True once user drags, disables auto-pin
+        self._user_x = 0               # user-chosen window X
+        self._user_y = 0               # user-chosen window Y
+        self._click_through = False     # click-through mode
+        self._muted = False             # mute TTS audio
+        self._hidden = False            # hidden via tray
+        self._tray_icon = None          # pystray icon
+        self._context_menu = None       # right-click popup
+        self._mute_callback = None      # callback to notify main of mute state
+
+    # ══════════════════════════════════════════════════════════
+    #  Startup
+    # ══════════════════════════════════════════════════════════
 
     def start(self):
         """Start the overlay in a background thread."""
@@ -107,12 +137,27 @@ class SpriteOverlay:
         self._idle_text_h = 120                  # enough for name + text + chat button
         self._bottom_y = self._screen_h - config.SPRITE_MARGIN_BOTTOM - 50  # bottom edge (above taskbar)
 
-        # Initial window size (sprite + small idle text box)
+        # Load saved position or default to bottom-right
+        saved = self._load_position()
         win_h = display_h + self._idle_text_h + 10
-        win_x = self._screen_w - self._win_w - config.SPRITE_MARGIN_RIGHT
-        win_y = self._bottom_y - win_h
-        self._win_x = win_x
 
+        if saved:
+            win_x, win_y = saved
+            # Validate: make sure at least part of the window is on-screen
+            if (-self._win_w < win_x < self._screen_w and
+                    -win_h < win_y < self._screen_h):
+                self._user_positioned = True
+                self._user_x = win_x
+                self._user_y = win_y
+            else:
+                # Saved position is off-screen, fall back to default
+                win_x = self._screen_w - self._win_w - config.SPRITE_MARGIN_RIGHT
+                win_y = self._bottom_y - win_h
+        else:
+            win_x = self._screen_w - self._win_w - config.SPRITE_MARGIN_RIGHT
+            win_y = self._bottom_y - win_h
+
+        self._win_x = win_x
         self._root.geometry(f"{self._win_w}x{win_h}+{win_x}+{win_y}")
 
         # ─── Sprite Display ──────────────────────────────────
@@ -205,15 +250,314 @@ class SpriteOverlay:
         self._chat_button.pack(anchor="w", pady=(4, 0))
         self._chat_button.bind("<Button-1>", self._toggle_chat)
 
+        # ─── Bind Drag Events ─────────────────────────────────
+        self._sprite_label.bind("<ButtonPress-1>", self._on_drag_start)
+        self._sprite_label.bind("<B1-Motion>", self._on_drag_motion)
+        self._sprite_label.bind("<ButtonRelease-1>", self._on_drag_end)
+
+        # Also allow dragging from the text frame / name label
+        for widget in (self._text_frame, self._name_label):
+            widget.bind("<ButtonPress-1>", self._on_drag_start)
+            widget.bind("<B1-Motion>", self._on_drag_motion)
+            widget.bind("<ButtonRelease-1>", self._on_drag_end)
+
+        # ─── Double-click sprite to toggle chat ──────────────
+        self._sprite_label.bind("<Double-Button-1>", self._toggle_chat)
+
+        # ─── Right-click context menu ─────────────────────────
+        self._build_context_menu()
+        self._sprite_label.bind("<Button-3>", self._show_context_menu)
+        self._text_frame.bind("<Button-3>", self._show_context_menu)
+        self._name_label.bind("<Button-3>", self._show_context_menu)
+        self._text_label.bind("<Button-3>", self._show_context_menu)
+
         # Set initial sprite to neutral — ALWAYS VISIBLE from the start
         self._set_sprite("Open")
 
         # Show immediately — VTuber mode, always visible
         self._root.deiconify()
 
+        # Start system tray icon
+        if config.TRAY_ENABLED:
+            tray_thread = threading.Thread(target=self._start_tray, daemon=True)
+            tray_thread.start()
+
         # Poll for updates from other threads
         self._root.after(80, self._check_pending)
         self._root.mainloop()
+
+    # ══════════════════════════════════════════════════════════
+    #  Drag-to-Reposition
+    # ══════════════════════════════════════════════════════════
+
+    def _on_drag_start(self, event):
+        """Record the mouse offset within the window for drag calculation."""
+        self._drag_start_x = event.x_root - self._root.winfo_x()
+        self._drag_start_y = event.y_root - self._root.winfo_y()
+
+    def _on_drag_motion(self, event):
+        """Move the window to follow the mouse in real-time."""
+        new_x = event.x_root - self._drag_start_x
+        new_y = event.y_root - self._drag_start_y
+        self._root.geometry(f"+{new_x}+{new_y}")
+
+    def _on_drag_end(self, event):
+        """Finalize position after drag, save it, and switch to user-positioned mode."""
+        self._user_x = self._root.winfo_x()
+        self._user_y = self._root.winfo_y()
+        self._user_positioned = True
+        self._win_x = self._user_x
+        self._save_position()
+
+    # ══════════════════════════════════════════════════════════
+    #  Position Persistence
+    # ══════════════════════════════════════════════════════════
+
+    def _save_position(self):
+        """Save current window position to a JSON file."""
+        try:
+            data = {"x": self._user_x, "y": self._user_y}
+            with open(config.POSITION_SAVE_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"[Sprite] ✗ Failed to save position: {e}")
+
+    def _load_position(self) -> tuple[int, int] | None:
+        """Load saved window position from JSON. Returns (x, y) or None."""
+        try:
+            if os.path.exists(config.POSITION_SAVE_FILE):
+                with open(config.POSITION_SAVE_FILE, "r") as f:
+                    data = json.load(f)
+                return (int(data["x"]), int(data["y"]))
+        except Exception as e:
+            print(f"[Sprite] ✗ Failed to load position: {e}")
+        return None
+
+    # ══════════════════════════════════════════════════════════
+    #  Right-Click Context Menu
+    # ══════════════════════════════════════════════════════════
+
+    def _build_context_menu(self):
+        """Create the right-click popup menu."""
+        self._context_menu = tk.Menu(
+            self._root,
+            tearoff=0,
+            bg="#1a1a2e",
+            fg="#ff6b9d",
+            activebackground="#2a1a3e",
+            activeforeground="#FFD700",
+            font=("Segoe UI", 10),
+            relief="flat",
+            borderwidth=1,
+        )
+        self._context_menu.add_command(
+            label="💬  Ask me something...",
+            command=lambda: self._toggle_chat(),
+        )
+        self._context_menu.add_separator()
+        self._context_menu.add_command(
+            label="📌  Reset Position",
+            command=self._reset_position,
+        )
+        self._context_menu.add_command(
+            label="🔇  Mute Voice",
+            command=self._toggle_mute,
+        )
+        self._context_menu.add_command(
+            label="👻  Click-Through Mode",
+            command=self._toggle_click_through,
+        )
+        self._context_menu.add_separator()
+        self._context_menu.add_command(
+            label="🙈  Hide (use tray to show)",
+            command=self._hide_window,
+        )
+        self._context_menu.add_command(
+            label="❌  Quit April",
+            command=self._quit_app,
+        )
+
+    def _show_context_menu(self, event):
+        """Display the context menu at the mouse position."""
+        if self._context_menu:
+            # Update dynamic labels before showing
+            mute_label = "🔊  Unmute Voice" if self._muted else "🔇  Mute Voice"
+            self._context_menu.entryconfigure(3, label=mute_label)
+
+            ct_label = "🖱️  Disable Click-Through" if self._click_through else "👻  Click-Through Mode"
+            self._context_menu.entryconfigure(4, label=ct_label)
+
+            try:
+                self._context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self._context_menu.grab_release()
+
+    # ══════════════════════════════════════════════════════════
+    #  Context Menu Actions
+    # ══════════════════════════════════════════════════════════
+
+    def _reset_position(self):
+        """Snap back to default bottom-right position."""
+        self._user_positioned = False
+        win_h = self._root.winfo_height()
+        win_x = self._screen_w - self._win_w - config.SPRITE_MARGIN_RIGHT
+        win_y = self._bottom_y - win_h
+        self._win_x = win_x
+        self._user_x = win_x
+        self._user_y = win_y
+        self._root.geometry(f"{self._win_w}x{win_h}+{win_x}+{win_y}")
+        # Delete saved position file
+        try:
+            if os.path.exists(config.POSITION_SAVE_FILE):
+                os.remove(config.POSITION_SAVE_FILE)
+        except Exception:
+            pass
+
+    def _toggle_mute(self):
+        """Toggle TTS mute state."""
+        self._muted = not self._muted
+        state = "muted 🔇" if self._muted else "unmuted 🔊"
+        print(f"[Sprite] Voice {state}")
+        if self._mute_callback:
+            self._mute_callback(self._muted)
+
+    def _toggle_click_through(self):
+        """Toggle click-through mode using Windows API."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            current_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+
+            if self._click_through:
+                # Disable click-through: remove WS_EX_TRANSPARENT
+                new_style = current_style & ~WS_EX_TRANSPARENT
+                self._click_through = False
+                print("[Sprite] Click-through OFF — window is interactive")
+            else:
+                # Enable click-through: add WS_EX_TRANSPARENT
+                new_style = current_style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+                self._click_through = True
+                print("[Sprite] Click-through ON — clicks pass through April")
+                # Auto-disable after 30 seconds so user doesn't get stuck
+                self._root.after(30000, self._auto_disable_click_through)
+
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+        except Exception as e:
+            print(f"[Sprite] ✗ Click-through toggle failed: {e}")
+
+    def _auto_disable_click_through(self):
+        """Safety: auto-disable click-through after timeout."""
+        if self._click_through:
+            self._toggle_click_through()
+            if self._text_label:
+                self._text_label.config(text="( click-through expired — I'm back! ♡ )")
+
+    def _hide_window(self):
+        """Hide the overlay window (can restore from tray)."""
+        if self._root:
+            self._root.withdraw()
+            self._hidden = True
+
+    def _unhide_window(self):
+        """Show the overlay window again."""
+        if self._root:
+            self._root.deiconify()
+            self._root.attributes("-topmost", True)
+            self._hidden = False
+
+    def _quit_app(self):
+        """Clean shutdown from context menu."""
+        self._save_position()
+        self.stop()
+        os._exit(0)
+
+    # ══════════════════════════════════════════════════════════
+    #  System Tray Icon
+    # ══════════════════════════════════════════════════════════
+
+    def _create_tray_image(self):
+        """Generate a small pink heart icon for the system tray."""
+        size = 64
+        img = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Draw a pink filled circle as base
+        draw.ellipse([4, 4, size - 4, size - 4], fill=(255, 107, 157, 255))
+
+        # Draw "A" in the center
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype("segoeui.ttf", 32)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Center the text
+        bbox = draw.textbbox((0, 0), "A", font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = (size - tw) // 2
+        ty = (size - th) // 2 - 2
+        draw.text((tx, ty), "A", fill=(255, 255, 255, 255), font=font)
+
+        return img
+
+    def _start_tray(self):
+        """Start pystray system tray icon in its own thread."""
+        try:
+            import pystray
+            from pystray import MenuItem, Menu
+
+            icon_image = self._create_tray_image()
+
+            def on_show_hide(icon, item):
+                if self._hidden:
+                    self._root.after(0, self._unhide_window)
+                else:
+                    self._root.after(0, self._hide_window)
+
+            def on_mute(icon, item):
+                self._root.after(0, self._toggle_mute)
+
+            def on_reset(icon, item):
+                self._root.after(0, self._reset_position)
+
+            def on_quit(icon, item):
+                self._save_position()
+                icon.stop()
+                self._root.after(0, self._quit_app)
+
+            def is_muted(item):
+                return self._muted
+
+            menu = Menu(
+                MenuItem(
+                    "Show / Hide April",
+                    on_show_hide,
+                    default=True,  # double-click tray icon = show/hide
+                ),
+                Menu.SEPARATOR,
+                MenuItem("Mute Voice", on_mute, checked=is_muted),
+                MenuItem("Reset Position", on_reset),
+                Menu.SEPARATOR,
+                MenuItem("Quit April", on_quit),
+            )
+
+            self._tray_icon = pystray.Icon(
+                "april_companion",
+                icon_image,
+                "April — Desktop Companion ♡",
+                menu,
+            )
+            self._tray_icon.run()
+
+        except ImportError:
+            print("[Sprite] ⚠ pystray not installed — tray icon disabled")
+            print("[Sprite]   Install with: pip install pystray")
+        except Exception as e:
+            print(f"[Sprite] ✗ Tray icon failed: {e}")
+
+    # ══════════════════════════════════════════════════════════
+    #  Sprite Loading & Display
+    # ══════════════════════════════════════════════════════════
 
     def _preload_sprites(self):
         """Load and resize all sprite PNGs into cache with proper chroma key compositing."""
@@ -280,6 +624,10 @@ class SpriteOverlay:
             self._sprite_label.image = photo  # prevent garbage collection
             self._current_expression = expression
 
+    # ══════════════════════════════════════════════════════════
+    #  Update Polling & Application
+    # ══════════════════════════════════════════════════════════
+
     def _check_pending(self):
         """Poll for pending updates from other threads."""
         if self._pending_update is not None:
@@ -337,9 +685,14 @@ class SpriteOverlay:
             self._on_text_timeout,
         )
 
+    # ══════════════════════════════════════════════════════════
+    #  Window Resizing (respects user-chosen position)
+    # ══════════════════════════════════════════════════════════
+
     def _resize_for_text(self):
         """Dynamically resize the window to fit the current dialogue text.
-        Grows upward so the bottom edge stays pinned to the taskbar."""
+        If user-positioned: grows downward from the user's chosen spot.
+        If default: grows upward so the bottom edge stays pinned to the taskbar."""
         if not self._root or not self._text_frame:
             return
         # Let Tk recalculate widget sizes
@@ -348,9 +701,14 @@ class SpriteOverlay:
         text_h = self._text_frame.winfo_reqheight()
         # Total window height: sprite + text + padding
         new_win_h = self._display_h + text_h + 20
-        # Keep bottom edge pinned, grow upward
-        new_y = self._bottom_y - new_win_h
-        self._root.geometry(f"{self._win_w}x{new_win_h}+{self._win_x}+{new_y}")
+
+        if self._user_positioned:
+            # User has placed April somewhere — keep top-left pinned, grow downward
+            self._root.geometry(f"{self._win_w}x{new_win_h}+{self._user_x}+{self._user_y}")
+        else:
+            # Default mode — bottom-right pinned, grow upward
+            new_y = self._bottom_y - new_win_h
+            self._root.geometry(f"{self._win_w}x{new_win_h}+{self._win_x}+{new_y}")
 
     def _resize_for_idle(self):
         """Shrink window back to compact idle size when dialogue clears."""
@@ -359,8 +717,16 @@ class SpriteOverlay:
         self._root.update_idletasks()
         text_h = self._text_frame.winfo_reqheight()
         new_win_h = self._display_h + text_h + 20
-        new_y = self._bottom_y - new_win_h
-        self._root.geometry(f"{self._win_w}x{new_win_h}+{self._win_x}+{new_y}")
+
+        if self._user_positioned:
+            self._root.geometry(f"{self._win_w}x{new_win_h}+{self._user_x}+{self._user_y}")
+        else:
+            new_y = self._bottom_y - new_win_h
+            self._root.geometry(f"{self._win_w}x{new_win_h}+{self._win_x}+{new_y}")
+
+    # ══════════════════════════════════════════════════════════
+    #  Lip Sync Animation
+    # ══════════════════════════════════════════════════════════
 
     def _start_lip_sync(self, emotion: str, action_type: str,
                         emotional_intensity: str, dialogue: str):
@@ -448,6 +814,11 @@ class SpriteOverlay:
             "emotional_intensity": emotional_intensity,
         }
 
+    @property
+    def muted(self) -> bool:
+        """Thread-safe: check if TTS is muted."""
+        return self._muted
+
     def get_pending_question(self) -> str | None:
         """Thread-safe: retrieve and clear any pending user question."""
         q = self._pending_question
@@ -459,10 +830,20 @@ class SpriteOverlay:
         """Set a callback to be invoked when a user question is submitted."""
         self._question_callback = callback
 
+    def set_mute_callback(self, callback):
+        """Set a callback to be invoked when mute state changes."""
+        self._mute_callback = callback
+
     def stop(self):
         """Stop the overlay."""
         self._running = False
         self._is_talking = False
+        self._save_position()
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
         if self._root:
             try:
                 self._root.quit()

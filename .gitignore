@@ -23,3 +23,11 @@ __pycache__/
 # OS Cache
 .DS_Store
 Thumbs.db
+
+# RVC Sidecar
+rvc_sidecar/venv/
+rvc_sidecar/models/**/*.pth
+rvc_sidecar/models/**/*.index
+
+# Local configuration files
+april_position.json

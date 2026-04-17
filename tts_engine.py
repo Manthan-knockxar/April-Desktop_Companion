@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+import base64
 
 import soundfile as sf
 import requests
@@ -30,6 +31,9 @@ def _clean_text_for_tts(text: str) -> str:
     text = text.replace('—', ', ').replace('–', ', ')
     # Replace ellipsis character with dots
     text = text.replace('…', '...')
+    # Collapse excessive dots/ellipsis (model sometimes outputs "... ... ... ..." garbage)
+    text = re.sub(r'\.{3,}', '...', text)           # "......" → "..."
+    text = re.sub(r'(\.\.\.\s*){2,}', '... ', text) # "... ... ... ..." → "... "
     # Remove any non-ASCII characters (emoji, CJK, symbols, etc.)
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
     # Clean up multiple spaces
@@ -43,18 +47,20 @@ def _clean_text_for_tts(text: str) -> str:
 # ─── Kokoro Setup ────────────────────────────────────────────
 _kokoro_pipeline = None
 _voicevox_available = False
+_rvc_available = False
 
 def _check_voicevox() -> bool:
+    global _voicevox_available
     try:
         r = requests.get(f"{config.VOICEVOX_URL}/speakers", timeout=2)
-        return r.status_code == 200
+        _voicevox_available = (r.status_code == 200)
+        return _voicevox_available
     except Exception:
+        _voicevox_available = False
         return False
 
-def init_tts():
-    """Initialize TTS engines, detect availability."""
-    global _voicevox_available, _kokoro_pipeline
-
+def _init_kokoro():
+    global _kokoro_pipeline
     if os.path.exists(config.KOKORO_MODEL_PATH) and os.path.exists(config.KOKORO_VOICES_PATH):
         try:
             from kokoro_onnx import Kokoro
@@ -65,12 +71,67 @@ def init_tts():
     else:
         log.warn("Kokoro models missing. Skipping offline init.")
 
+def _check_rvc():
+    """Check if the RVC sidecar is running."""
+    global _rvc_available
+    if getattr(config, "RVC_ENABLED", False) is False:
+        _rvc_available = False
+        return
+
+    try:
+        resp = requests.get(f"{config.RVC_SIDECAR_URL}/health", timeout=2)
+        if resp.status_code == 200 and resp.json().get("status") == "ok":
+            log.success(f"RVC sidecar connected — model={resp.json().get('model')}")
+            _rvc_available = True
+        else:
+            log.warn(f"RVC sidecar running, but model not loaded: {resp.json()}")
+            _rvc_available = False
+    except Exception as e:
+        log.warn(f"RVC sidecar unavailable (is it running?): {e}")
+        _rvc_available = False
+
+def _apply_rvc(wav_bytes: bytes) -> bytes | None:
+    """Pass base audio through RVC sidecar to apply anime voice."""
+    if not _rvc_available:
+        return None
+        
+    try:
+        with log.timed("RVC voice conversion (Ironmouse)"):
+            b64_audio = base64.b64encode(wav_bytes).decode("ascii")
+            resp = requests.post(
+                f"{config.RVC_SIDECAR_URL}/convert",
+                json={
+                    "audio_b64": b64_audio, 
+                    "f0_change": getattr(config, "RVC_PITCH_SHIFT", 0)
+                },
+                timeout=getattr(config, "RVC_TIMEOUT", 10)
+            )
+            resp.raise_for_status()
+            
+            result_data = resp.json()
+            converted_b64 = result_data.get("audio_b64")
+            
+            if converted_b64:
+                return base64.b64decode(converted_b64)
+            return None
+            
+    except Exception as e:
+        log.error("RVC conversion failed", exc=e)
+        return None
+
+def init_tts():
+    """Initialize TTS engines, detect availability."""
+    global _voicevox_available, _kokoro_pipeline
+    _init_kokoro()
+    
     log.info(f"Checking VOICEVOX at {config.VOICEVOX_URL}...")
-    _voicevox_available = _check_voicevox()
+    _check_voicevox()
     if _voicevox_available:
         log.success(f"VOICEVOX detected — speaker={config.VOICEVOX_SPEAKER}")
     else:
         log.debug("VOICEVOX not found (optional)")
+
+    _check_rvc()
 
     log.success(f"edge-tts ready — voice={config.EDGE_TTS_VOICE}, rate={config.EDGE_TTS_RATE}")
 
@@ -214,6 +275,16 @@ def synthesize(text: str, action_type: str = "commentary") -> tuple[bytes | None
         log.info("Trying Kokoro-ONNX (primary)...")
         audio = _speak_kokoro(text)
         if audio:
+            # 1b. Apply RVC post-processing if enabled and available
+            if _rvc_available:
+                log.info("Applying RVC voice conversion (Ironmouse)...")
+                converted_audio = _apply_rvc(audio)
+                if converted_audio:
+                    log.success(f"RVC succeeded — {len(converted_audio) / 1024:.1f}KB WAV")
+                    return converted_audio, "wav"
+                else:
+                    log.warn("RVC failed, falling back to raw Kokoro audio")
+            
             return audio, "wav"
 
     # 2. Try edge-tts (fallback)

@@ -387,6 +387,12 @@ def _parse_response(text: str) -> dict | None:
         log.debug(f"Raw model output was: {text[:500]}")
         return None
 
+    # ── Degenerate output check: reject dot-spam from confused model ──
+    stripped = re.sub(r'[.\s]+', '', reaction)
+    if len(stripped) < 10:
+        log.warn(f"Rejected degenerate output (only {len(stripped)} real chars): \"{reaction[:60]}\"")
+        return None
+
     # ── Validate: REACTION must be spoken dialogue, not a scene description ──
     _desc_prefixes = (
         "the user is", "the user has", "the user's", "the screen shows",
