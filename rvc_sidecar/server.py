@@ -9,14 +9,19 @@ Exposes:
 Pre-loads the RVC model on startup for fast inference.
 """
 import base64
-import io
 import os
-import sys
 import tempfile
 import time
 
+# PyTorch 2.6 breaking change workaround for fairseq
+import torch
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
 
@@ -36,6 +41,9 @@ RVC_DEVICE = os.getenv("RVC_DEVICE", "cuda:0")
 RVC_F0_METHOD = os.getenv("RVC_F0_METHOD", "rmvpe")
 RVC_F0_CHANGE = int(os.getenv("RVC_F0_CHANGE", "0"))  # pitch shift in semitones
 RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.75"))
+RVC_PROTECT = float(os.getenv("RVC_PROTECT", "0.33"))
+RVC_RMS_MIX = float(os.getenv("RVC_RMS_MIX", "0.25"))
+RVC_FILTER_RADIUS = int(os.getenv("RVC_FILTER_RADIUS", "3"))
 
 
 class ConvertRequest(BaseModel):
@@ -67,34 +75,36 @@ def _init_rvc():
 
         pth_file, index_file = _find_model_files()
         if not pth_file:
-            print(f"[RVC] ✗ No .pth model found in {MODELS_DIR}")
-            print(f"[RVC]   Run setup_rvc.ps1 to download the Ironmouse model")
+            print(f"[RVC] [X] No .pth model found in {MODELS_DIR}")
+            print("[RVC]   Run setup_rvc.ps1 to download the Ironmouse model")
             return False
 
         print(f"[RVC] Loading model: {os.path.basename(pth_file)}")
         print(f"[RVC] Device: {RVC_DEVICE} | F0: {RVC_F0_METHOD} | Pitch: {RVC_F0_CHANGE}")
 
         _rvc = RVCInference(device=RVC_DEVICE)
-        _rvc.load_model(pth_file)
+        _rvc.load_model(pth_file, index_path=index_file or "")
 
         # Configure inference params
         _rvc.set_params(
             f0method=RVC_F0_METHOD,
             f0up_key=RVC_F0_CHANGE,
             index_rate=RVC_INDEX_RATE if index_file else 0.0,
-            protect=0.33,
+            protect=RVC_PROTECT,
+            rms_mix_rate=RVC_RMS_MIX,
+            filter_radius=RVC_FILTER_RADIUS,
         )
 
         _model_loaded = True
-        print(f"[RVC] ✓ Model loaded successfully")
+        print("[RVC] [OK] Model loaded successfully")
         if index_file:
-            print(f"[RVC] ✓ Index file: {os.path.basename(index_file)}")
+            print(f"[RVC] [OK] Index file: {os.path.basename(index_file)}")
         else:
-            print(f"[RVC] ⚠ No .index file found (quality may be reduced)")
+            print("[RVC] [!] No .index file found (quality may be reduced)")
         return True
 
     except Exception as e:
-        print(f"[RVC] ✗ Failed to initialize: {e}")
+        print(f"[RVC] [X] Failed to initialize: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -103,11 +113,11 @@ def _init_rvc():
 @app.on_event("startup")
 async def startup():
     """Load RVC model when server starts."""
-    print(f"[RVC] ═══ April RVC Sidecar Starting ═══")
+    print("[RVC] --- April RVC Sidecar Starting ---")
     print(f"[RVC] Models dir: {MODELS_DIR}")
     success = _init_rvc()
     if not success:
-        print(f"[RVC] ⚠ Server running but no model loaded — /convert will fail")
+        print("[RVC] [!] Server running but no model loaded — /convert will fail")
 
 
 @app.get("/health")
@@ -121,7 +131,7 @@ async def health():
 
 
 @app.post("/convert")
-async def convert(req: ConvertRequest):
+def convert(req: ConvertRequest):
     """Convert base64-encoded WAV audio through the loaded RVC model."""
     if not _model_loaded or _rvc is None:
         raise HTTPException(status_code=503, detail="RVC model not loaded")
@@ -151,13 +161,9 @@ async def convert(req: ConvertRequest):
 
             start = time.perf_counter()
 
-            # Find index file for quality boost
-            _, index_file = _find_model_files()
-
             _rvc.infer_file(
                 input_path=tmp_in.name,
                 output_path=tmp_out.name,
-                index_path=index_file,
             )
 
             elapsed = time.perf_counter() - start

@@ -29,7 +29,7 @@ import tkinter as tk
 from PIL import Image as PILImage, ImageTk, ImageDraw
 
 import config
-from emotion_mapper import get_sprite_expression, get_sprite_filename
+from emotion_mapper import get_sprite_expression
 
 # Chroma key — this EXACT color becomes transparent via Windows API.
 # Must NOT appear anywhere in the sprite art.
@@ -314,9 +314,15 @@ class SpriteOverlay:
     # ══════════════════════════════════════════════════════════
 
     def _save_position(self):
-        """Save current window position to a JSON file."""
+        """Save current window position and size to a JSON file."""
         try:
-            data = {"x": self._user_x, "y": self._user_y}
+            # Get current geometry
+            w = self._root.winfo_width()
+            h = self._root.winfo_height()
+            x = self._root.winfo_x()
+            y = self._root.winfo_y()
+            
+            data = {"x": x, "y": y, "w": w, "h": h}
             with open(config.POSITION_SAVE_FILE, "w") as f:
                 json.dump(data, f)
         except Exception as e:

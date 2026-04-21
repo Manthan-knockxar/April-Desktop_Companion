@@ -8,9 +8,11 @@ since mss uses thread-local Win32 DC handles internally.
 """
 import threading
 
+import json
+import os
 import numpy as np
 from mss import mss
-from PIL import Image
+from PIL import Image, ImageDraw
 import config
 from logger import Log
 
@@ -35,7 +37,43 @@ def capture_screen() -> Image.Image:
     monitor = sct.monitors[config.MONITOR_INDEX]
     screenshot = sct.grab(monitor)
     img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+    
+    # Mask out April's own UI elements so she doesn't perceive herself
+    img = _mask_companion_ui(img)
+    
     log.debug(f"Captured {img.width}x{img.height} from monitor {config.MONITOR_INDEX}")
+    return img
+
+
+def _mask_companion_ui(img: Image.Image) -> Image.Image:
+    """Read April's current window position and black out that area."""
+    draw = ImageDraw.Draw(img)
+    masked = False
+    
+    try:
+        if os.path.exists(config.POSITION_SAVE_FILE):
+            with open(config.POSITION_SAVE_FILE, "r") as f:
+                pos = json.load(f)
+            
+            # Simple rectangle mask for the whole companion window
+            # (x, y) are screen-relative; mss capture is also screen-relative for the monitor
+            x, y = pos.get("x", 0), pos.get("y", 0)
+            w, h = pos.get("w", 400), pos.get("h", 600)
+            
+            # Convert screen coords to relative monitor coords if needed
+            # For primary monitor(index 1), mss usually matches screen coords
+            # We'll use a safety margin
+            draw.rectangle([x-5, y-5, x+w+5, y+h+5], fill="black")
+            masked = True
+    except Exception as e:
+        log.warn(f"Failed to mask based on position file: {e}")
+
+    # Fallback/Safety: Mask the bottom-right corner where she usually lives
+    if not masked:
+        w, h = img.size
+        # Mask a generic 450x700 area in the bottom right
+        draw.rectangle([w-500, h-750, w, h], fill="black")
+
     return img
 
 

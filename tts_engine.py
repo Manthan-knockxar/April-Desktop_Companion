@@ -176,7 +176,7 @@ def _speak_kokoro(text: str) -> bytes | None:
     if not _kokoro_pipeline:
         return None
     try:
-        with log.timed(f"Kokoro-ONNX synthesis"):
+        with log.timed("Kokoro-ONNX synthesis"):
             samples, sample_rate = _kokoro_pipeline.create(
                 text, voice=config.KOKORO_VOICE, speed=config.KOKORO_SPEED, lang="en-us"
             )

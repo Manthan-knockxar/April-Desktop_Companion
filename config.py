@@ -8,14 +8,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── Ollama (Local LLM) ─────────────────────────────────────
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2-vision")
+# Two-Stage Pipeline:
+#   Stage 1 (Perception): OLLAMA_MODEL (vision) — tiny prompt + screenshot → scene description
+#   Stage 2 (Personality): OLLAMA_TEXT_MODEL (text-only) — scene + full personality → tsundere reaction
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2-vision:latest")        # Vision model (Stage 1)
+OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")          # Fast text model (Stage 2)
+OLLAMA_NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "16"))  # Vision model layers
+OLLAMA_TEXT_NUM_GPU = -1                                  # Full GPU offload for 3B text model
 
 # Inference settings — tuned for RTX 4060 Mobile (8GB VRAM)
-OLLAMA_VISION_TEMPERATURE = 0.3       # conservative for scene analysis
-OLLAMA_REACT_TEMPERATURE = 0.95       # creative for tsundere dialogue
+OLLAMA_VISION_TEMPERATURE = 0.3       # conservative for scene analysis (Stage 1)
+OLLAMA_REACT_TEMPERATURE = 0.75       # creative for tsundere dialogue (Stage 2)
 OLLAMA_TIMEOUT = 120                  # local inference can be slower than cloud
-OLLAMA_NUM_GPU = -1                   # -1 = offload all layers to GPU (4060 has enough VRAM)
 
 # ─── Screen Capture ──────────────────────────────────────────
 CAPTURE_INTERVAL = 5          # seconds between background context captures
@@ -31,12 +36,12 @@ DOWNSCALE_WIDTH = 768         # resize screenshots before sending to model
 DOWNSCALE_HEIGHT = 432        # (saves VRAM, faster inference — 768x432 balances quality vs speed)
 
 # ─── VOICEVOX TTS (Fallback) ─────────────────────────────────
-VOICEVOX_URL = "http://localhost:50021"
+VOICEVOX_URL = "http://127.0.0.1:50021"
 VOICEVOX_SPEAKER = 1          # speaker ID (0=四国めたん, 1=ずんだもん, etc.)
 
 # ─── Kokoro TTS (Primary - Offline, Expressive) ──────────────
 KOKORO_MODEL_PATH = "models/kokoro/kokoro-v0_19.onnx"
-KOKORO_VOICES_PATH = "models/kokoro/voices-anime.bin"
+KOKORO_VOICES_PATH = "models/kokoro/voices-anime.bin.npz"
 KOKORO_VOICE = "af_tsundere"            # CUSTOM community blend
 KOKORO_SPEED = 1.15                     # faster for energetic tsundere vibe
 
@@ -82,6 +87,11 @@ TRAY_ENABLED = True               # system tray icon for show/hide/quit
 
 # ─── RVC Voice Conversion ────────────────────────────────────
 RVC_ENABLED = True
-RVC_SIDECAR_URL = "http://localhost:5055"
-RVC_PITCH_SHIFT = 0               # semitone pitch shift (0 for Ironmouse)
-RVC_TIMEOUT = 10                  # seconds to wait for conversion
+RVC_SIDECAR_URL = "http://127.0.0.1:5055"
+RVC_PITCH_SHIFT = 18              # semitone pitch shift (0 for Ironmouse)
+RVC_PITCH_SHIFT = 12              # Reduced to 12 (one octave) for a cuter, more "human" tone
+RVC_INDEX_RATE = 0.45             # Lowered for a much smoother, flowing vocal quality
+RVC_PROTECT = 0.5                 # Keeps the voice clear and breathy
+RVC_RMS_MIX = 0.15                # Low value makes the volume flow more softly and cutely
+RVC_FILTER_RADIUS = 3             # Standard filtering for natural pitch transitions
+RVC_TIMEOUT = 30                  # seconds to wait for conversion

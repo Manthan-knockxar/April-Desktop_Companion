@@ -1,65 +1,43 @@
 """
-Scene Reactor — merged vision + dialogue in a SINGLE local model call.
-Sends screenshot to llama3.2-vision (via Ollama), gets scene description AND
-tsundere reaction in one shot.
+Scene Reactor — Two-Stage Pipeline Architecture.
 
-Runs 100% locally — no cloud API, no rate limits, no API keys.
-Now generalized for ANY screen content — desktop, browsers, apps, games, etc.
+Stage 1 (Perception): Send screenshot to llama3.2-vision with a tiny prompt.
+    → Returns a factual scene description in ~3-5 seconds.
+Stage 2 (Personality): Feed that description + full tsundere personality prompt
+    to the fast llama3.2:3b text model.
+    → Returns structured <<<FIELD>>> reaction in ~1-2 seconds.
+
+Total turnaround: ~5-8 seconds vs 25-35 seconds with single-stage.
 """
 import io
 import time
 import re
-import random
 import threading
 import ollama
 from PIL import Image
+
 import config
 from logger import Log
+from comeback_templates import get_comeback_style, get_vocabulary_constraint
+from context_resolver import ContextLabel
 
 log = Log("Reactor")
 
 # ─── Threading Lock for Ollama ───────────────────────────────
 _ollama_lock = threading.Lock()
 
-
 # ─── Recent dialogue memory (anti-repetition) ────────────────
 _recent_dialogues: list[str] = []
 MAX_RECENT = 12
 
-INTENSITY_MODIFIERS = {
-    "MAXIMUM_ANGER": "You are FURIOUS. Be extremely dramatic, yell at them.",
-    "VERY_ANNOYED": "You are very annoyed. Show escalating frustration.",
-    "SECRETLY_FOND": "You secretly like this person but would NEVER admit it. Compliment then immediately backtrack.",
-    "WARMING_UP": "Slightly less hostile. Tiny cracks of kindness showing. Maybe give a genuine tip.",
-    "GENUINELY_MAD": "Genuinely upset. Be cold and cutting.",
-    "BORED_FRUSTRATED": "You are BORED OUT OF YOUR MIND. Dramatically demand they do something else. Be creative about HOW bored you are.",
-    "DEFAULT_TSUNDERE": "Standard tsundere. A mix of insults, hidden care, and occasionally helpful observations.",
-}
-
-# Reaction variety templates — the model picks a style each time
-REACTION_STYLES = [
-    "Give a sarcastic observation about what they're doing on their screen",
-    "Reluctantly give them a helpful tip while pretending you don't care",
-    "React dramatically to something specific visible on screen",
-    "Judge their productivity (or lack thereof) with tsundere flair",
-    "Comment on their browsing habits, app choices, or workflow",
-    "Express concern about their screen time but disguise it as an insult",
-    "Challenge them to do something more impressive",
-    "Make a witty comparison or metaphor about their current activity",
-    "Roast their desktop organization or window management",
-    "Give unsolicited advice about what they should be doing instead",
-]
-
-
 def _build_anti_repeat_section() -> str:
     if not _recent_dialogues:
-        return ""
-    lines = "\n".join(f'  - "{d}"' for d in _recent_dialogues[-6:])
-    return f"""
-YOUR RECENT LINES (DO NOT repeat these themes, phrases, or sentence structures):
-{lines}
-
-CRITICAL: Say something COMPLETELY DIFFERENT. Different opening word, different topic, different tone."""
+        return "(No recent lines yet)"
+    lines = []
+    for d in _recent_dialogues[-6:]:
+        words = d.split()[:8]
+        lines.append(f"  - {' '.join(words)}...")
+    return "\n".join(lines)
 
 
 def _downscale_image(image: Image.Image) -> Image.Image:
@@ -68,13 +46,12 @@ def _downscale_image(image: Image.Image) -> Image.Image:
     target_h = config.DOWNSCALE_HEIGHT
     if image.width > target_w or image.height > target_h:
         log.debug(f"Downscaling {image.width}x{image.height} → {target_w}x{target_h}")
-        image = image.resize((target_w, target_h), Image.LANCZOS)
+        image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
     return image
 
 
 def _pil_to_bytes(image: Image.Image) -> bytes:
-    """Convert PIL Image to JPEG bytes for Ollama vision input.
-    JPEG is ~4x smaller than PNG, speeding up payload transfer."""
+    """Convert PIL Image to JPEG bytes for Ollama vision input."""
     buf = io.BytesIO()
     if image.mode == "RGBA":
         image = image.convert("RGB")
@@ -83,12 +60,11 @@ def _pil_to_bytes(image: Image.Image) -> bytes:
 
 
 def _call_ollama(prompt: str, image: Image.Image | None = None,
-                 temperature: float = 0.95, max_tokens: int = 400,
-                 tag: str = "Ollama") -> str | None:
+                 temperature: float = 0.7, max_tokens: int = 400,
+                 tag: str = "Ollama", model_override: str | None = None) -> str | None:
     """
     Unified call to Ollama local model with retry logic.
     Supports text-only and multimodal (image) requests.
-    Returns the response text or None on failure.
     """
     messages = []
     if image is not None:
@@ -104,10 +80,13 @@ def _call_ollama(prompt: str, image: Image.Image | None = None,
             "content": prompt,
         })
 
+    model_to_use = model_override if model_override else config.OLLAMA_MODEL
+    gpu_layers = getattr(config, "OLLAMA_TEXT_NUM_GPU", -1) if model_override else config.OLLAMA_NUM_GPU
+
     max_retries = 2
     for attempt in range(1, max_retries + 1):
         try:
-            log.info(f"[{tag}] Calling {config.OLLAMA_MODEL} (attempt {attempt}/{max_retries})")
+            log.info(f"[{tag}] Calling {model_to_use} (attempt {attempt}/{max_retries})")
             
             with log.timed(f"[{tag}] Waiting for Ollama lock"):
                 acquired = _ollama_lock.acquire(timeout=90)
@@ -117,13 +96,13 @@ def _call_ollama(prompt: str, image: Image.Image | None = None,
             try:
                 with log.timed(f"[{tag}] Local inference"):
                     response = ollama.chat(
-                        model=config.OLLAMA_MODEL,
+                        model=model_to_use,
                         messages=messages,
                         options={
                             "temperature": temperature,
                             "num_predict": max_tokens,
                             "num_ctx": 2048,
-                            "num_gpu": config.OLLAMA_NUM_GPU,
+                            "num_gpu": gpu_layers,
                         },
                     )
             finally:
@@ -140,360 +119,313 @@ def _call_ollama(prompt: str, image: Image.Image | None = None,
         except Exception as e:
             error_type = type(e).__name__
             log.error(f"[{tag}] {error_type}: {str(e)[:200]}")
-            if "connection" in str(e).lower() or "refused" in str(e).lower():
-                log.error(f"[{tag}] Cannot reach Ollama at {config.OLLAMA_BASE_URL} — is it running?")
             if attempt < max_retries:
                 time.sleep(3)
 
-    log.error(f"[{tag}] All {max_retries} attempts failed")
     return None
 
 
-def analyze_and_react(
-    image: Image.Image,
-    context_summary: str,
-    emotional_intensity: str,
-    boredom_count: int = 0,
-    accumulated_scenes: list[str] | None = None,
-    system_context: str = "",
-    enriched_window: str = "",
-) -> dict | None:
-    """
-    Send screenshot to local llama3.2-vision and get BOTH scene analysis AND
-    tsundere dialogue in a single inference call. Returns dict with 'scene',
-    'dialogue', 'emotion', and 'action_type' keys, or None on failure.
-    """
-    log.info(f"Starting reaction — intensity={emotional_intensity}, boredom={boredom_count}, "
-             f"accumulated_scenes={len(accumulated_scenes or [])}, anti_repeat_pool={len(_recent_dialogues)}")
+# ═══════════════════════════════════════════════════════════════
+# STAGE 1: PERCEPTION (Vision Model — tiny prompt, fast)
+# ═══════════════════════════════════════════════════════════════
 
-    # Downscale for performance
+def _stage1_perceive(image: Image.Image, context_label: ContextLabel) -> str | None:
+    """
+    Send the screenshot to the vision model with a minimal prompt.
+    Returns a short factual scene description.
+    """
     image = _downscale_image(image)
+    
+    prompt = f"""Describe what you see on this computer screen in 1-2 sentences.
+Ignore any large black rectangles (those are your own interface).
+Focus on: the main application, what specific content is visible, and what the user appears to be doing.
+Context hint: {context_label.specific_context}
+Keep it factual and under 30 words."""
 
-    intensity_note = INTENSITY_MODIFIERS.get(emotional_intensity, INTENSITY_MODIFIERS["DEFAULT_TSUNDERE"])
-    anti_repeat = _build_anti_repeat_section()
-
-    # Pick a reaction style based on cycle count for variety
-    style_hint = random.choice(REACTION_STYLES)
-    log.debug(f"Style hint: \"{style_hint}\"")
-
-    # Build accumulated context from silent captures
-    accumulated_context = ""
-    if accumulated_scenes:
-        accumulated_context = "\nRECENT OBSERVATIONS (what you've been silently watching):\n"
-        for i, s in enumerate(accumulated_scenes[-4:], 1):
-            accumulated_context += f"  {i}. {s}\n"
-        accumulated_context += "Use these observations to give a more informed, context-rich reaction.\n"
-
-    # Add boredom context
-    boredom_note = ""
-    if boredom_count >= 3:
-        boredom_note = (
-            "\n⚠️ BOREDOM ALERT: The user has been doing THE SAME THING for a while now. "
-            "Express extreme frustration OR give them a creative suggestion of what to do instead."
-        )
-    elif boredom_count >= 2:
-        boredom_note = (
-            "\n⚠️ The user is still doing the same thing. Show growing impatience "
-            "or suggest they try something different."
-        )
-
-    prompt = f"""You are April, a tsundere anime girl desktop companion. You watch the user's screen and react.
-
-ACTIVITY: {enriched_window}
-STYLE: {style_hint}
-MOOD: {intensity_note}
-{boredom_note}
-
-RULES:
-- You are April. Use "I"/"me". Sharp-tongued, dramatic, secretly caring.
-- React to VISUAL DETAILS on screen, not just the app/title name.
-- The user is a VIEWER of content unless they are clearly coding/gaming themselves.
-- Keep REACTION to 1-2 sentences. Be snarky, specific, and creative.
-- NEVER start with "Seriously?" or end with "it's not like I care".
-- NEVER repeat the SCENE text in your REACTION.
-{accumulated_context}
-SYSTEM: {system_context}
-{anti_repeat}
-
-Respond with EXACTLY these 4 lines and NOTHING ELSE — no headers, no markdown, no extra commentary:
-SCENE: [1-2 sentence factual description of what you see on screen]
-EMOTION: [ONE word: neutral, angry, happy, smug, flustered, disappointed, worried]
-ACTION: [ONE word: commentary, roast, impressed, concerned, bored]
-REACTION: [Your spoken dialogue — snarky comment directed at the user]
-
-If screen is black: SCENE: idle desktop / EMOTION: disappointed / ACTION: bored / REACTION: [react to emptiness]"""
-
-    text = _call_ollama(
-        prompt=prompt,
-        image=image,
-        temperature=config.OLLAMA_REACT_TEMPERATURE,
-        max_tokens=400,
-        tag="React",
-    )
-
-    if text is None:
-        log.error("Local inference failed — no response")
-        return None
-
-    # Parse the structured response
-    result = _parse_response(text)
-    if result:
-        # ── Hard duplicate check: reject if too similar to recent dialogue ──
-        new_dialogue = result["dialogue"].lower()
-        new_words = set(new_dialogue.split())
-        for prev in _recent_dialogues:
-            prev_words = set(prev.lower().split())
-            if len(new_words) > 5 and len(prev_words) > 5:
-                overlap = len(new_words & prev_words) / max(len(new_words), 1)
-                if overlap > 0.50:
-                    log.warn(f"Rejected duplicate dialogue ({overlap:.0%} overlap with recent): "
-                             f"\"{result['dialogue'][:60]}...\"")
-                    result = None
-                    break
-
-    if result:
-        log.success(f"Reaction — emotion={result['emotion']}, "
-                     f"action={result['action_type']}, dialogue_len={len(result['dialogue'])}")
-        # Track dialogue for anti-repetition
-        if result["dialogue"]:
-            _recent_dialogues.append(result["dialogue"])
-            if len(_recent_dialogues) > MAX_RECENT:
-                _recent_dialogues.pop(0)
-        return result
-    else:
-        log.warn("Response failed parsing")
-        return None
-
-
-def analyze_scene_silent(image: Image.Image) -> str | None:
-    """
-    Quick scene-only analysis for context gathering (no dialogue).
-    Used during silent capture cycles between reactions.
-    """
-    _silent_log = Log("Silent")
-
-    # Downscale for performance
-    image = _downscale_image(image)
-
-    prompt = (
-        "Describe what the user is doing on their computer in 1 short sentence. "
-        "Include: what app or website is visible, what activity they seem to be doing. "
-        "If the screen is black or locked, respond with NOTHING_NOTABLE."
-    )
-
-    text = _call_ollama(
+    return _call_ollama(
         prompt=prompt,
         image=image,
         temperature=config.OLLAMA_VISION_TEMPERATURE,
-        max_tokens=100,
-        tag="Silent",
+        max_tokens=80,
+        tag="Vision",
     )
 
-    if text is None:
-        _silent_log.error("Silent context inference failed")
-        return None
 
-    if "NOTHING_NOTABLE" in text.upper():
-        _silent_log.debug("Screen is blank/locked — nothing notable")
-        return None
+# ═══════════════════════════════════════════════════════════════
+# STAGE 2: PERSONALITY (Text Model — rich prompt, no image)
+# ═══════════════════════════════════════════════════════════════
 
-    _silent_log.success(f"Context: \"{text[:100]}\"")
-    return text
-
-
-def _parse_response(text: str) -> dict | None:
-    """Parse the SCENE:/EMOTION:/ACTION:/REACTION: formatted response.
-    
-    Handles model quirks:
-    - Markdown bold wrappers (**SCENE:**)
-    - Extra headers/commentary after the 4 fields
-    - Multi-word emotion lines ("I'm feeling smug" → "smug")
-    - Action aliases ("comment" → "commentary")
+def _parse_response(text: str, context_label: ContextLabel) -> dict | None:
     """
-    scene = ""
+    Flexible parser that handles multiple output formats from the 3B model.
+    
+    The model tends to output in these patterns:
+      Pattern A (ideal):   <<<EMOTION>>> angry <<<ACTION>>> roast <<<REACTION>>> text...
+      Pattern B (common):  <<<ANGRY>>> text... <<<ROAST>>> text... <<<REACTION>>> text...
+      Pattern C (minimal): <<<ANGRY>>> commentary\nActual reaction text here...
+    """
     emotion = "neutral"
     action_type = "commentary"
     reaction = ""
-
-    valid_emotions = {"neutral", "angry", "happy", "smug", "flustered", "disappointed", "worried"}
-    valid_actions = {"commentary", "roast", "impressed", "concerned", "bored"}
     
-    # Aliases for common model action typos
-    action_aliases = {
-        "comment": "commentary", "commenting": "commentary",
-        "roasting": "roast", "impress": "impressed",
-        "concern": "concerned", "concerning": "concerned",
-        "bore": "bored", "boring": "bored",
-    }
-
-    # ── Pre-clean: strip markdown headers the model sometimes wraps output in ──
-    # Remove lines like "**April's Response**", "**STRETCHING GUIDELINES:**", etc.
-    text = re.sub(r'^\s*\*{2,}[^*\n]+\*{2,}\s*$', '', text, flags=re.MULTILINE)
-    # Remove everything after recognized "extra" sections the model invents
-    for cutoff in ["STRETCHING GUIDELINES", "FILLING THE SPACE", "REVIEWER", "Note:", "---"]:
-        idx = text.upper().find(cutoff.upper())
-        if idx > 0:
-            text = text[:idx]
-
-    # ── Regex extraction (handles **bold** field names) ──
-    scene_m = re.search(r'\*{0,2}SCENE\*{0,2}[:\s]\s*(.*?)(?=\n\s*\*{0,2}EMOTION|\Z)', text, re.IGNORECASE | re.DOTALL)
-    emotion_m = re.search(r'\*{0,2}EMOTION\*{0,2}[:\s]\s*([^\n]+)', text, re.IGNORECASE)
-    action_m = re.search(r'\*{0,2}ACTION\*{0,2}[:\s]\s*([^\n]+)', text, re.IGNORECASE)
-    react_m = re.search(r'\*{0,2}REACTION\*{0,2}[:\s]\s*(.*?)(?=\n\s*(?:I hope|Let me|Here is|Note:|\*{2})|\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
-
-    if scene_m:
-        scene = scene_m.group(1).strip().strip('"\'*')
+    valid_emotions = {"neutral", "angry", "happy", "smug", "flustered", "disappointed", "worried", "confused"}
+    valid_actions = {"commentary", "roast", "impressed", "concerned", "bored", "curious"}
     
-    if emotion_m:
-        raw = emotion_m.group(1)
-        cleaned = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
-        # Use regex to find the first valid emotion keyword ANYWHERE in the line
-        emo_match = re.search(r'\b(' + '|'.join(valid_emotions) + r')\b', cleaned)
+    text_lower = text.lower()
+
+    # ── Step 1: Extract emotion ──
+    # Try explicit <<<EMOTION>>> tag first
+    m_emo = re.search(r'<<<EMOTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
+    if m_emo:
+        emo_text = m_emo.group(1).strip().lower()
+        emo_match = re.search(r'\b(' + '|'.join(valid_emotions) + r')\b', emo_text)
         if emo_match:
             emotion = emo_match.group(1)
-        else:
-            log.debug(f"Invalid emotion '{cleaned}', defaulting to 'neutral'")
-            
-    if action_m:
-        raw = action_m.group(1)
-        parsed = raw.replace('*', '').replace('"', '').replace("'", '').strip().lower()
-        if parsed in valid_actions:
-            action_type = parsed
-        elif parsed in action_aliases:
-            action_type = action_aliases[parsed]
-            log.debug(f"Action alias '{parsed}' → '{action_type}'")
-        else:
-            # Try to find a valid action keyword in the line
-            act_match = re.search(r'\b(' + '|'.join(valid_actions) + r')\b', parsed)
-            if act_match:
-                action_type = act_match.group(1)
-            else:
-                log.debug(f"Invalid action '{parsed}', defaulting to 'commentary'")
-            
-    if react_m:
-        reaction = react_m.group(1).strip().strip('"\'*')
-        # Clean stray quotes that might have been stranded due to stripping
-        if reaction.startswith('"') and reaction.endswith('"'):
-            reaction = reaction[1:-1]
-        # Strip markdown formatting that sounds terrible in TTS
-        reaction = reaction.replace('**', '').replace('__', '')
-        reaction = reaction.replace('*', '').replace('_', '')
-        # Strip trailing "– April" or similar attribution
-        reaction = re.sub(r'\s*[–—-]\s*April\s*$', '', reaction, flags=re.IGNORECASE)
-        reaction = reaction.strip()
+    else:
+        # Fallback: check if model used <<<EMOTION_WORD>>> as the tag itself
+        for emo in valid_emotions:
+            if f'<<<{emo.upper()}>>>' in text or f'<<<{emo.capitalize()}>>>' in text:
+                emotion = emo
+                break
 
-    if not scene or not reaction or reaction.lower() == "none":
-        log.warn("Parse failed — no usable reaction text")
-        log.debug(f"Raw model output was: {text[:500]}")
+    # ── Step 2: Extract action ──
+    # Try explicit <<<ACTION>>> tag first
+    m_act = re.search(r'<<<ACTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
+    if m_act:
+        act_text = m_act.group(1).strip().lower()
+        act_match = re.search(r'\b(' + '|'.join(valid_actions) + r')\b', act_text)
+        if act_match:
+            action_type = act_match.group(1)
+    else:
+        # Fallback: check if model used <<<ACTION_WORD>>> as the tag, or scan text
+        for act in valid_actions:
+            if f'<<<{act.upper()}>>>' in text or f'<<<{act.capitalize()}>>>' in text:
+                action_type = act
+                break
+        # Also check for action word appearing right after an emotion tag line
+        act_scan = re.search(r'\b(' + '|'.join(valid_actions) + r')\b', text_lower)
+        if act_scan:
+            action_type = act_scan.group(1)
+
+    # ── Step 3: Extract reaction text ──
+    # Try explicit <<<REACTION>>> tag first
+    m_react = re.search(r'<<<REACTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
+    if m_react:
+        reaction = m_react.group(1).strip()
+    else:
+        # Fallback: grab the longest paragraph of actual dialogue
+        # Strip all <<<TAG>>> markers and their single-word values, keep the rest
+        cleaned = re.sub(r'<<<[^>]+>>>', '\n', text)
+        # Remove standalone emotion/action words on their own line
+        lines = []
+        for line in cleaned.split('\n'):
+            stripped = line.strip()
+            # Skip lines that are just a single emotion/action word
+            if stripped.lower() in valid_emotions or stripped.lower() in valid_actions:
+                continue
+            # Skip empty lines and very short fragments
+            if len(stripped) > 10:
+                lines.append(stripped)
+        if lines:
+            # Take the longest line as the reaction
+            reaction = max(lines, key=len)
+    
+    # Clean up the reaction
+    reaction = reaction.replace('**', '').replace('"', '').strip()
+    
+    if not reaction:
+        log.warn("Parse failed — no reaction text found in any format")
         return None
 
-    # ── Degenerate output check: reject dot-spam from confused model ──
-    stripped = re.sub(r'[.\s]+', '', reaction)
-    if len(stripped) < 10:
-        log.warn(f"Rejected degenerate output (only {len(stripped)} real chars): \"{reaction[:60]}\"")
+    words = reaction.split()
+    if len(words) < 5 or len(words) > 80:
+        log.warn(f"Parse failed — word count {len(words)} out of bounds")
         return None
-
-    # ── Validate: REACTION must be spoken dialogue, not a scene description ──
-    _desc_prefixes = (
-        "the user is", "the user has", "the user's", "the screen shows",
-        "you are in", "you're in", "you have", "you're looking at",
-        "you're staring at", "the user appears",
-    )
-    reaction_lower = reaction.lower().strip()
-    is_description = any(reaction_lower.startswith(p) for p in _desc_prefixes)
-
-    if is_description:
-        log.warn(f"Rejected: reaction starts with description prefix → \"{reaction[:60]}...\"")
-        return None
-
-    # Also check if reaction is suspiciously similar to the scene (relaxed threshold)
-    if scene and reaction:
-        scene_words = set(scene.lower().split())
-        react_words = set(reaction.lower().split())
-        if len(scene_words) > 5 and len(react_words) > 5:
-            overlap = len(scene_words & react_words) / max(len(react_words), 1)
-            if overlap > 0.70:
-                log.warn(f"Rejected: reaction overlaps scene by {overlap:.0%} → \"{reaction[:60]}...\"")
-                return None
-            elif overlap > 0.4:
-                log.debug(f"Scene/reaction overlap: {overlap:.0%} (within threshold)")
+    
+    # Normalize confused → neutral (not a valid sprite)
+    if emotion == "confused":
+        emotion = "neutral"
 
     return {
-        "scene": scene,
+        "scene": "",  # Will be filled by caller from Stage 1
         "emotion": emotion,
         "action_type": action_type,
         "dialogue": reaction,
     }
 
 
-def answer_user_question(
-    question: str,
-    image: Image.Image,
+def _stage2_react(
+    scene_description: str,
+    context_label: ContextLabel,
+    novelty_flag: bool,
+    time_context: dict,
+    personality_note: str,
+    callback_flag: bool,
+    emotional_intensity: str,
     system_context: str = "",
-    context_summary: str = "",
+    subtitle_buffer: list[str] | None = None,
+    session_narrative: str = "",
 ) -> dict | None:
     """
-    Answer a direct user question with tsundere personality.
-    Uses the current screenshot + system context for awareness.
-    Returns dict with 'scene', 'dialogue', 'emotion', 'action_type'.
+    Send the scene description + full personality prompt to the fast text model.
+    Returns a structured reaction with emotion, action, and dialogue.
     """
-    _qa_log = Log("Q&A")
-    _qa_log.info(f"Answering question: \"{question[:80]}\"")
+    time_str = time_context.get("time_string", "Unknown time")
+    
+    subs_str = ""
+    if context_label.category == "video" and subtitle_buffer:
+        subs_str = "\nDIALOGUE ON SCREEN:\n" + "\n".join(f"- {line}" for line in subtitle_buffer)
 
-    image = _downscale_image(image)
-    anti_repeat = _build_anti_repeat_section()
+    callback_str = ""
+    if callback_flag:
+        callback_str = "\nThe user was doing this earlier and left. They just came back to it."
 
-    prompt = f"""You are April, a tsundere anime girl who lives on someone's desktop as their AI companion.
+    style_hint = get_comeback_style(emotional_intensity, is_curious=novelty_flag)
+    vocab_hint = get_vocabulary_constraint(emotional_intensity)
 
-PERSONALITY:
-- Your name is April. Always use "I" or "me".
-- Sharp-tongued but secretly helpful. You WILL answer their question properly.
-- Even when helping, you wrap it in tsundere attitude — reluctant help, backhanded compliments
-- Keep your answer concise but complete: 1-3 sentences MAX
-- If the question is about something on their screen, look at the screenshot carefully
+    curious_rule = ""
+    if novelty_flag:
+        curious_rule = "\n- CURIOSITY: You've never seen this before. ACTION must be 'curious'. Ask what it is."
 
-The user is asking you a DIRECT QUESTION. You MUST answer it helpfully (even if you pretend to be annoyed about it).
+    prompt = f"""You are April, a tsundere anime girl living on a user's desktop. You are sharp-tongued, dramatic, and secretly caring. You speak directly TO the user using "you". 
+NOTE: You are a desktop companion. If there's a black box in your vision, that's just your own UI being masked out—ignore it.
 
-SYSTEM CONTEXT:
-{system_context}
+WHAT YOU SEE: {scene_description}
+TIME: {time_str}
+ACTIVITY: {context_label.specific_context}
+{personality_note}{subs_str}{callback_str}
 
-{context_summary}
-{anti_repeat}
+STYLE: {style_hint}
+VOCAB: {vocab_hint}
 
-USER'S QUESTION: "{question}"
+DO NOT REPEAT THESE RECENT LINES:
+{_build_anti_repeat_section()}
 
-TASK: Look at the screenshot and answer their question. Respond with EXACTLY this format:
-SCENE: [brief factual description of what's on screen]
-EMOTION: [Pick ONE: neutral, angry, happy, smug, flustered, disappointed, worried]
-ACTION: [Pick ONE: commentary, roast, impressed, concerned, bored]
-REACTION: [Your spoken answer to their question — this is what you SAY OUT LOUD]
-
-⚠️ REACTION must be YOUR SPOKEN WORDS answering their question.
-NOT a description of the screen. You are TALKING to the user.
-Example: "Ugh, fine. You need to declare a 2D array first, then use nested for-loops. It's basic stuff, look it up!"
-BAD example: "The user is looking at Dev-C++ with an empty file" ← NEVER do this."""
+OUTPUT FORMAT — use these EXACT delimiters, nothing else:
+<<<EMOTION>>> one word: neutral/angry/happy/smug/flustered/disappointed/worried
+<<<ACTION>>> one word: commentary/roast/impressed/concerned/bored/curious
+<<<REACTION>>> 15-35 words. Talk TO the user about what you see. Be specific. Be sassy.{curious_rule}"""
 
     text = _call_ollama(
-        prompt=prompt,
-        image=image,
+        prompt=prompt.strip(),
+        image=None,
         temperature=config.OLLAMA_REACT_TEMPERATURE,
-        max_tokens=500,
-        tag="Q&A",
+        max_tokens=150,
+        tag="React",
+        model_override=config.OLLAMA_TEXT_MODEL,
     )
 
-    if text is None:
-        _qa_log.error("Q&A inference failed")
+    if not text:
         return None
 
-    result = _parse_response(text)
+    return _parse_response(text, context_label)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PUBLIC API (called by main.py)
+# ═══════════════════════════════════════════════════════════════
+
+def analyze_and_react(
+    image: Image.Image,
+    context_label: ContextLabel,
+    novelty_flag: bool,
+    time_context: dict,
+    personality_note: str,
+    callback_flag: bool,
+    emotional_intensity: str,
+    system_context: str = "",
+    subtitle_buffer: list[str] | None = None,
+    session_narrative: str = "",
+) -> dict | None:
+    """
+    Two-Stage Pipeline:
+      Stage 1: Vision model describes the screen (~3-5s)
+      Stage 2: Text model generates tsundere reaction (~1-2s)
+    """
+    total_start = time.time()
+
+    # ── Stage 1: Perception ──
+    log.info("═══ Stage 1: Perception (Vision) ═══")
+    scene_description = _stage1_perceive(image, context_label)
+    
+    if not scene_description:
+        log.warn("Stage 1 failed — no scene description from vision model")
+        return None
+    
+    log.success(f"Scene: {scene_description[:120]}")
+
+    # ── Stage 2: Personality ──
+    log.info("═══ Stage 2: Personality (Text) ═══")
+    result = _stage2_react(
+        scene_description=scene_description,
+        context_label=context_label,
+        novelty_flag=novelty_flag,
+        time_context=time_context,
+        personality_note=personality_note,
+        callback_flag=callback_flag,
+        emotional_intensity=emotional_intensity,
+        system_context=system_context,
+        subtitle_buffer=subtitle_buffer,
+        session_narrative=session_narrative,
+    )
+
     if result:
-        _qa_log.success(f"Answered — emotion={result['emotion']}, "
-                        f"dialogue: \"{result['dialogue'][:80]}\"")
+        result["scene"] = scene_description
+        total_time = time.time() - total_start
+        log.success(f"Pipeline complete in {total_time:.1f}s — emotion={result['emotion']}, action={result['action_type']}, words={len(result['dialogue'].split())}")
+        
         if result["dialogue"]:
             _recent_dialogues.append(result["dialogue"])
             if len(_recent_dialogues) > MAX_RECENT:
                 _recent_dialogues.pop(0)
         return result
-    else:
-        _qa_log.warn("Q&A response failed parsing")
-        return None
+
+    return None
+
+
+def analyze_scene_silent(image: Image.Image) -> str | None:
+    """Quick silent scene analysis using only Stage 1."""
+    return _stage1_perceive(image, ContextLabel(
+        category="unknown",
+        specific_context="General observation",
+        focus_instruction="Describe the screen.",
+        intent="unknown",
+    ))
+
+
+def answer_user_question(
+    question: str, image: Image.Image, system_context: str = "", context_summary: str = "",
+) -> dict | None:
+    """Answer a direct user question using the text model."""
+    scene = _stage1_perceive(image, ContextLabel(
+        category="unknown",
+        specific_context="User asked a question",
+        focus_instruction="Describe the screen.",
+        intent="unknown",
+    ))
+    
+    prompt = f"""You are April, a tsundere anime girl on the user's desktop. Answer their question directly but stay in character — sharp, dramatic, secretly caring.
+
+SCREEN: {scene or "Could not see screen"}
+SYSTEM: {system_context}
+USER'S QUESTION: {question}
+
+Answer in 1-2 sentences. Be helpful but sassy."""
+
+    text = _call_ollama(
+        prompt=prompt.strip(),
+        image=None,
+        temperature=0.7,
+        max_tokens=150,
+        tag="Question",
+        model_override=config.OLLAMA_TEXT_MODEL,
+    )
+    
+    if text:
+        return {
+            "scene": scene or "",
+            "emotion": "neutral",
+            "action_type": "commentary",
+            "dialogue": text.replace('**', '').replace('"', ''),
+        }
+    return None

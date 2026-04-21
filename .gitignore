@@ -31,3 +31,13 @@ rvc_sidecar/models/**/*.index
 
 # Local configuration files
 april_position.json
+
+# Logs and temporary files
+*.log
+*.wav
+rvc_sidecar/*.log
+rvc_sidecar/server_err.log
+rvc_sidecar/server_out.log
+rvc_sidecar/sidecar_*.log
+rvc_sidecar/debug_*.log
+

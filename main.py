@@ -50,18 +50,21 @@ try:
 except AttributeError:
     pass
 else:
-    ssl._create_default_https_context = _create_unverified_https_context
+    ssl._create_default_https_context = _create_unverified_https_context  # type: ignore
 # ─────────────────────────────────────────────────────────────
 
 import config
-from screen_capture import capture_screen, has_significant_change
-from scene_reactor import analyze_and_react, analyze_scene_silent, answer_user_question
-from context_memory import ContextMemory
+import title_ocr
+import context_resolver
+from subtitle_ocr import SubtitleOCR
+from context_memory import ContextMemory, get_time_context
+from scene_reactor import analyze_and_react, answer_user_question
 from tts_engine import init_tts, synthesize
 from audio_player import play_audio, stop as stop_audio
 from sprite_overlay import SpriteOverlay
 from system_info import get_system_context, get_enriched_context
-from logger import Log, PINK, CYAN, YELLOW, RED, GREEN, DIM, BOLD, RESET
+from screen_capture import capture_screen, has_significant_change
+from logger import Log, PINK, CYAN, YELLOW, DIM, BOLD, RESET
 
 # Module loggers
 log_main = Log("Main")
@@ -124,7 +127,11 @@ _question_event = threading.Event()  # signaled when a user question arrives
 def _context_worker():
     """
     Runs continuously in the background.
-    Captures screen and analyzes context silently every CAPTURE_INTERVAL.
+    Captures screen and tracks frame changes for the main loop.
+    
+    NOTE: Does NOT call the vision model anymore. In the two-stage pipeline,
+    Stage 1 in the main loop already does vision. Running vision here too
+    caused lock contention that doubled response times.
     """
     cycle_count = 0
     while True:
@@ -135,23 +142,11 @@ def _context_worker():
             
             # Smart skip — check for visual change
             if config.SKIP_UNCHANGED_FRAMES and not has_significant_change(image):
-                log_ctx.debug(f"Frame unchanged — skipping API call (cycle #{cycle_count})")
+                log_ctx.debug(f"Frame unchanged — skipping (cycle #{cycle_count})")
                 time.sleep(config.CAPTURE_INTERVAL)
                 continue
                 
-            log_ctx.info(f"Gathering context (cycle #{cycle_count})...")
-            scene_desc = analyze_scene_silent(image)
-            
-            if scene_desc:
-                with _accumulated_lock:
-                    _accumulated_scenes.append(scene_desc)
-                    scene_count = len(_accumulated_scenes)
-                    # Keep only last few for context
-                    if len(_accumulated_scenes) > 6:
-                        _accumulated_scenes.pop(0)
-                log_ctx.success(f"Context ({scene_count} buffered): {scene_desc[:100]}")
-            else:
-                log_ctx.debug("No notable context gathered this cycle")
+            log_ctx.debug(f"Frame changed (cycle #{cycle_count})")
                 
         except Exception as e:
             log_ctx.error("Context worker error", exc=e)
@@ -210,23 +205,38 @@ def main():
         import ollama
         models = ollama.list()
         model_names = [m.model for m in models.models] if models.models else []
-        found = any(config.OLLAMA_MODEL in name for name in model_names)
-        if not found:
-            log_main.error(f"Model '{config.OLLAMA_MODEL}' not found in Ollama!")
+        
+        # Check vision model (Stage 1)
+        found_vision = any(config.OLLAMA_MODEL in name for name in model_names)
+        if not found_vision:
+            log_main.error(f"Vision model '{config.OLLAMA_MODEL}' not found in Ollama!")
             log_main.info(f"Available models: {model_names if model_names else 'none'}")
             print(f"  Run: {BOLD}ollama pull {config.OLLAMA_MODEL}{RESET}")
             sys.exit(1)
-        log_main.success(f"Ollama connected — model '{config.OLLAMA_MODEL}' ready")
+        log_main.success(f"Ollama connected — vision model '{config.OLLAMA_MODEL}' ready")
+        
+        # Check text model (Stage 2)
+        found_text = any(config.OLLAMA_TEXT_MODEL in name for name in model_names)
+        if not found_text:
+            log_main.error(f"Text model '{config.OLLAMA_TEXT_MODEL}' not found in Ollama!")
+            print(f"  Run: {BOLD}ollama pull {config.OLLAMA_TEXT_MODEL}{RESET}")
+            sys.exit(1)
+        log_main.success(f"Text model '{config.OLLAMA_TEXT_MODEL}' ready (Stage 2)")
         
         # Warm-up inference to pre-load model weights (avoids 30s cold start)
-        log_main.info("Warming up model (first inference)...")
+        log_main.info("Warming up models (first inference)...")
         try:
             ollama.chat(
                 model=config.OLLAMA_MODEL,
                 messages=[{"role": "user", "content": "Say hi in 3 words."}],
                 options={"num_predict": 10, "num_ctx": 256},
             )
-            log_main.success("Model warmed up")
+            ollama.chat(
+                model=config.OLLAMA_TEXT_MODEL,
+                messages=[{"role": "user", "content": "Say hi in 3 words."}],
+                options={"num_predict": 10, "num_ctx": 256},
+            )
+            log_main.success("Both models warmed up")
         except Exception:
             log_main.warn("Warm-up failed (non-fatal) — first reaction may be slow")
     except Exception as e:
@@ -243,16 +253,37 @@ def main():
         venv_python = os.path.join(sidecar_dir, "venv", "Scripts", "python.exe")
         try:
             if os.path.exists(venv_python):
+                # Redirect logs to files for debugging
+                log_out = open(os.path.join(sidecar_dir, "sidecar_stdout.log"), "a")
+                log_err = open(os.path.join(sidecar_dir, "sidecar_stderr.log"), "a")
+                
+                # Pass config to sidecar via env vars
+                sidecar_env = os.environ.copy()
+                sidecar_env["RVC_F0_CHANGE"] = str(getattr(config, "RVC_PITCH_SHIFT", 0))
+                sidecar_env["RVC_INDEX_RATE"] = str(getattr(config, "RVC_INDEX_RATE", 0.75))
+                sidecar_env["RVC_PROTECT"] = str(getattr(config, "RVC_PROTECT", 0.33))
+                sidecar_env["RVC_RMS_MIX"] = str(getattr(config, "RVC_RMS_MIX", 0.25))
+                sidecar_env["RVC_FILTER_RADIUS"] = str(getattr(config, "RVC_FILTER_RADIUS", 3))
+
                 rvc_process = subprocess.Popen(
                     [venv_python, "server.py"],
                     cwd=sidecar_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=log_out,
+                    stderr=log_err,
+                    env=sidecar_env,
                 )
                 atexit.register(lambda: rvc_process.terminate())
-                # Yield roughly 5 seconds for the heavy PyTorch model to load into GPU
-                log_main.debug("Waiting ~6s for RVC sidecar to warm up...")
-                time.sleep(6)
+                # Wait for the heavy PyTorch model to load into GPU (poll health endpoint)
+                log_main.debug("Waiting for RVC sidecar to warm up...")
+                import requests
+                for _ in range(15):
+                    try:
+                        resp = requests.get(f"{config.RVC_SIDECAR_URL}/health", timeout=2)
+                        if resp.status_code == 200:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(2)
             else:
                 log_main.warn("RVC enabled but Python 3.10 venv not found. Run setup_rvc.ps1 first.")
         except Exception as e:
@@ -261,6 +292,10 @@ def main():
     # Initialize systems
     log_main.info("Initializing TTS engine...")
     init_tts()
+    
+    # Phase 10: Initialize EasyOCR singleton
+    log_main.info("Initializing OCR (CPU) - this takes a few seconds...")
+    title_ocr.init_ocr()
 
     # Initialize sprite overlay — always visible from the start
     global _overlay_ref
@@ -275,10 +310,11 @@ def main():
         log_main.success(f"Sprite overlay started (draggable, {tray_status})")
 
     memory = ContextMemory()
+    subtitle_thread = SubtitleOCR(memory)
 
     # Log configuration
     log_main.info(f"Config: capture_interval={config.CAPTURE_INTERVAL}s, react_interval={config.REACT_INTERVAL}s")
-    log_main.info(f"Config: model={config.OLLAMA_MODEL}, gpu_layers={config.OLLAMA_NUM_GPU}")
+    log_main.info(f"Config: vision={config.OLLAMA_MODEL}, text={config.OLLAMA_TEXT_MODEL}, gpu_layers={config.OLLAMA_NUM_GPU}")
     log_main.info(f"Config: frame_diff_threshold={config.FRAME_DIFF_THRESHOLD}, "
                   f"downscale={config.DOWNSCALE_WIDTH}x{config.DOWNSCALE_HEIGHT}")
     log_main.success("Ready! Watching your screen — reacts to anything (100% local)")
@@ -316,14 +352,39 @@ def main():
             # Gather real-time system context (open apps, CPU, battery, etc.)
             with log_main.timed("System context gathering"):
                 system_context, enriched_window = get_enriched_context()
-            for line in system_context.split("\n"):
-                log_main.debug(f"System: {line}")
-            log_main.info(f"🎯 Activity: {enriched_window}")
 
+            # Phase 10: Perception
+            title_text, process_name = title_ocr.get_active_window_info_win32()
+            if not title_text:
+                title_text = title_ocr.get_active_window_title_ocr_fallback()
+                
+            context_label = context_resolver.resolve(title_text, process_name)
+            
+            # Subtitle daemon management
+            if context_label.category == "video":
+                subtitle_thread.start()
+            else:
+                subtitle_thread.stop()
+                
+            # Phase 10: State Updates
+            memory.update_activity(context_label.intent, context_label.specific_context)
+            
+            novelty_flag = context_label.specific_context not in memory.seen_contexts
+            if novelty_flag:
+                memory.seen_contexts.add(context_label.specific_context)
+                
+            time_context = get_time_context()
+            
+            from context_resolver import APRIL_OPINIONS
+            personality_note = APRIL_OPINIONS.get(process_name, "") # Note: In actual implementation, match against opinions heuristic. Let's just pass empty for now unless matched later.
+            
+            callback_flag = memory.should_callback(context_label.intent)
+
+            log_main.info(f"🎯 Activity: {context_label.specific_context} (Intent: {context_label.intent})")
             log_main.info(f"Memory state: affection={memory.affection}, streak={memory.roast_streak}, "
-                          f"boredom={memory.similar_scene_streak}, total={memory.total_interactions}")
+                          f"duration={memory.get_activity_duration()}m, total={memory.total_interactions}")
 
-            # Boredom suppression check — only suppress after 3+ genuinely stale scenes
+            # Boredom suppression check
             is_similar_now = memory.similar_scene_streak >= 3
             if not memory.should_react(action_type=memory.last_reaction_label, scene_is_similar=is_similar_now):
                 log_main.debug("Skipping reaction — boredom suppression active")
@@ -332,12 +393,15 @@ def main():
 
             result = analyze_and_react(
                 image=image,
-                context_summary=memory.get_context_summary(),
+                context_label=context_label,
+                novelty_flag=novelty_flag,
+                time_context=time_context,
+                personality_note=personality_note,
+                callback_flag=callback_flag,
                 emotional_intensity=memory.get_emotional_intensity(),
-                boredom_count=memory.similar_scene_streak,
-                accumulated_scenes=current_scenes,
                 system_context=system_context,
-                enriched_window=enriched_window,
+                subtitle_buffer=list(memory.subtitle_buffer),
+                session_narrative=memory.get_context_summary()
             )
 
             if result is None:
