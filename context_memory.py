@@ -5,8 +5,11 @@ and escalating emotion thresholds.
 import time
 from collections import deque
 from datetime import datetime
+import json
+import os
 
 import config
+from datetime import datetime
 
 def get_time_context() -> dict:
     """Phase 4 — Time of Day Awareness."""
@@ -65,6 +68,43 @@ class ContextMemory:
         self.recent_events: list[dict] = []
         self.last_reaction_label: str = "commentary"
         self.last_scene_description: str = ""
+        
+        # Phase 9: Episodic Memory
+        self.past_session_summary: str = ""
+        self._load_memory()
+        
+        # April 2.0: Productivity Tracking
+        self.productive_minutes: float = 0.0
+        self.unproductive_minutes: float = 0.0
+        self.longest_productive_streak: float = 0.0   # minutes
+        self._current_streak_start: float | None = None
+        self._last_tick: float = time.time()
+        
+        # April 2.0: Action cancellation memory
+        self.action_was_cancelled: bool = False  # set True when user cancels an action
+        self.cancelled_action_label: str = ""     # what was cancelled
+
+    def _load_memory(self):
+        """Loads previous session's narrative to inject into system context."""
+        try:
+            db_path = "memory_db.json"
+            if os.path.exists(db_path):
+                with open(db_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if "last_session_narrative" in data:
+                        self.past_session_summary = data["last_session_narrative"]
+        except Exception as e:
+            pass
+
+    def _save_memory(self):
+        """Saves current state so she remembers next time."""
+        try:
+            db_path = "memory_db.json"
+            data = {"last_session_narrative": self.session_narrative}
+            with open(db_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            pass
 
     def update_activity(self, new_intent: str, specific_context: str):
         """Update current activity, log history if changed, rebuild narrative."""
@@ -83,12 +123,94 @@ class ContextMemory:
             self.activity_session_start = now
             self.last_seen_apps[new_intent] = now
             
+            
             # Narrative is now stale, rebuild it
             self.build_session_narrative()
+            self._save_memory()
 
     def get_activity_duration(self) -> int:
         """Minutes spent in current activity."""
         return int((time.time() - self.activity_session_start) / 60)
+
+    def tick_productivity(self, current_intent: str):
+        """Called every reaction cycle to accumulate productive/unproductive time."""
+        now = time.time()
+        elapsed = (now - self._last_tick) / 60.0  # minutes since last tick
+        self._last_tick = now
+        
+        productive_intents = {"productive_coding", "system_admin"}
+        unproductive_intents = {"distracted_browsing", "leisure_video", "leisure_gaming"}
+        
+        if current_intent in productive_intents:
+            self.productive_minutes += elapsed
+            # Track streak
+            if self._current_streak_start is None:
+                self._current_streak_start = now
+            streak = (now - self._current_streak_start) / 60.0
+            if streak > self.longest_productive_streak:
+                self.longest_productive_streak = streak
+        else:
+            if current_intent in unproductive_intents:
+                self.unproductive_minutes += elapsed
+            # Break streak
+            self._current_streak_start = None
+
+    @property
+    def focus_score(self) -> float:
+        """Focus score from 0.0 to 1.0 — ratio of productive time."""
+        total = self.productive_minutes + self.unproductive_minutes
+        if total < 1.0:
+            return 0.5  # not enough data
+        return min(1.0, self.productive_minutes / total)
+
+    def get_daily_report(self) -> str:
+        """Generate a narrative daily productivity report."""
+        session_mins = int((time.time() - self.session_start) / 60)
+        score = self.focus_score
+        
+        # Grade
+        if score >= 0.8:
+            grade = "S-Rank"
+            comment = "You actually impressed me today. Don't let it go to your head."
+        elif score >= 0.6:
+            grade = "A-Rank"
+            comment = "Decent work. I've seen better, but I've definitely seen worse."
+        elif score >= 0.4:
+            grade = "B-Rank"
+            comment = "Mediocre. You spent half the time goofing off."
+        elif score >= 0.2:
+            grade = "C-Rank"
+            comment = "Pathetic. You call that a work session?"
+        else:
+            grade = "F-Rank"
+            comment = "You literally did nothing productive. I'm disappointed."
+        
+        report = f"""# April's Daily Report — {datetime.now().strftime('%B %d, %Y')}
+
+Session Duration: {session_mins} minutes
+Focus Score: {score:.0%} ({grade})
+Productive Time: {self.productive_minutes:.0f} min
+Distracted Time: {self.unproductive_minutes:.0f} min  
+Longest Focus Streak: {self.longest_productive_streak:.0f} min
+Total Interactions: {self.total_interactions}
+
+April's Verdict: {comment}
+"""
+        return report
+
+    def record_action_cancelled(self, action_label: str):
+        """Record that the user cancelled one of April's announced actions."""
+        self.action_was_cancelled = True
+        self.cancelled_action_label = action_label
+
+    def consume_action_cancelled(self) -> tuple[bool, str]:
+        """Check and clear the action-cancelled flag. Returns (was_cancelled, label)."""
+        if self.action_was_cancelled:
+            self.action_was_cancelled = False
+            label = self.cancelled_action_label
+            self.cancelled_action_label = ""
+            return True, label
+        return False, ""
 
     def should_callback(self, activity: str) -> bool:
         """Returns True if this activity was seen >15 mins ago."""
@@ -206,7 +328,9 @@ class ContextMemory:
         if not summary:
             summary = self.build_session_narrative()
             
-        return f"{summary}\nAffection: {self.affection}\nIntensity Label: {intensity}\nDuration on current task: {duration} mins"
+        past_note = f"\nPast Memory: {self.past_session_summary}" if self.past_session_summary else ""
+            
+        return f"{summary}{past_note}\nAffection: {self.affection}\nIntensity Label: {intensity}\nDuration on current task: {duration} mins"
 
     def should_react(self, action_type: str, scene_is_similar: bool) -> bool:
         """Rate limiting for commentary to reduce spam."""

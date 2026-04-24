@@ -14,7 +14,7 @@ load_dotenv()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2-vision:latest")        # Vision model (Stage 1)
 OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")          # Fast text model (Stage 2)
-OLLAMA_NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "16"))  # Vision model layers
+OLLAMA_NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "33"))  # Vision model layers — full GPU offload
 OLLAMA_TEXT_NUM_GPU = -1                                  # Full GPU offload for 3B text model
 
 # Inference settings — tuned for RTX 4060 Mobile (8GB VRAM)
@@ -95,3 +95,19 @@ RVC_PROTECT = 0.5                 # Keeps the voice clear and breathy
 RVC_RMS_MIX = 0.15                # Low value makes the volume flow more softly and cutely
 RVC_FILTER_RADIUS = 3             # Standard filtering for natural pitch transitions
 RVC_TIMEOUT = 30                  # seconds to wait for conversion
+
+# ─── April 2.0: Proactive Features ───────────────────────────
+ACTION_ANNOUNCE_DELAY = 5         # seconds April waits after announcing before acting
+CANCEL_HOTKEY = "ctrl+shift+x"   # key combo to cancel a pending announced action
+
+# ─── Pomodoro / Productivity ─────────────────────────────────
+POMODORO_DEFAULT_WORK = 25        # default Pomodoro work duration (minutes)
+POMODORO_DEFAULT_BREAK = 5        # default Pomodoro break duration (minutes)
+BREAK_WARNING_MINUTES = 90        # coding duration before break warning
+BREAK_DEMAND_MINUTES = 120        # coding duration before aggressive break demand
+DISTRACTION_COOLDOWN = 30         # seconds before re-warning about distractions
+
+# ─── Feature Flags ───────────────────────────────────────────
+PROACTIVE_BUG_DETECTION = True    # April offers fixes when she sees errors
+PROACTIVE_BREAK_REMINDERS = True  # April warns about long coding sessions
+PROACTIVE_MEDIA_CONTROL = True    # April can pause/play media

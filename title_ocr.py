@@ -87,6 +87,44 @@ def get_active_window_title_ocr_fallback() -> str:
         log.error(f"OCR fallback failed silently: {e}")
         return ""
 
+
+def ocr_screen_text(image) -> str:
+    """
+    Run OCR on a full screenshot (PIL Image) to extract visible text.
+    
+    This is used to augment the vision model's scene description with
+    ACTUAL text from the screen, so April reacts to what's really written.
+    
+    Returns up to 300 chars of cleaned text, or empty string on failure.
+    """
+    global _reader
+    if _reader is None:
+        return ""
+    
+    try:
+        import numpy as np
+        img_np = np.array(image)
+        
+        # Run OCR — detail=0 returns just strings
+        results = _reader.readtext(img_np, detail=0, paragraph=True)
+        
+        if not results:
+            return ""
+        
+        # Join and clean
+        raw_text = " ".join(results)
+        clean_text = re.sub(r'\s+', ' ', raw_text).strip()
+        
+        # Cap at 300 chars to keep prompt lean
+        if len(clean_text) > 300:
+            clean_text = clean_text[:300] + "..."
+        
+        return clean_text
+        
+    except Exception as e:
+        log.error(f"Screen OCR failed: {e}")
+        return ""
+
 if __name__ == "__main__":
     print("Testing Win32 Title Fetch (Fast Path)...")
     win32_title, win32_exe = get_active_window_info_win32()

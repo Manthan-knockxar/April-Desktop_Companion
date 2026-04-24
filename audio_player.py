@@ -45,8 +45,22 @@ def play_audio(audio_bytes: bytes, audio_format: str):
     thread.start()
 
 
-def _play_worker(audio_bytes: bytes, audio_format: str):
-    """Worker thread for audio playback."""
+def play_audio_blocking(audio_bytes: bytes, audio_format: str) -> float:
+    """
+    Play audio bytes SYNCHRONOUSLY in the calling thread.
+    Returns the duration of the audio in seconds.
+    Used by TTS worker for precise subtitle sync.
+    """
+    if not audio_bytes:
+        log.warn("play_audio_blocking called with empty bytes — skipping")
+        return 0.0
+
+    log.debug(f"Playing {len(audio_bytes) / 1024:.1f}KB {audio_format.upper()} (blocking)")
+    return _play_worker(audio_bytes, audio_format, return_duration=True) or 0.0
+
+
+def _play_worker(audio_bytes: bytes, audio_format: str, return_duration: bool = False):
+    """Worker for audio playback. Returns duration if return_duration=True."""
     global _current_stream
 
     try:
@@ -68,10 +82,10 @@ def _play_worker(audio_bytes: bytes, audio_format: str):
             except Exception as e:
                 log.error(f"soundfile can't decode MP3: {e}")
                 _cleanup_temp(tmp_path)
-                return
+                return 0.0 if return_duration else None
         else:
             log.error(f"Unknown audio format: {audio_format}")
-            return
+            return 0.0 if return_duration else None
 
         duration = len(data) / samplerate
         channels = data.shape[1] if data.ndim > 1 else 1
@@ -103,6 +117,8 @@ def _play_worker(audio_bytes: bytes, audio_format: str):
             _current_stream = None
             log.debug("Playback completed, stream closed")
             _cleanup_temp(tmp_path)
+
+        return duration if return_duration else None
 
     except Exception as e:
         log.error("Playback error", exc=e)

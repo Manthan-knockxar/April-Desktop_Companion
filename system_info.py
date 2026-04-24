@@ -197,6 +197,56 @@ def get_system_stats() -> dict:
     return stats
 
 
+# ─── Windows Media Integration ────────────────────────────────
+
+def get_current_media() -> str | None:
+    """Uses Windows Media Control API to fetch the currently playing media (Song/Video)."""
+    try:
+        import asyncio
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+        
+        async def _fetch_media():
+            sessions = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+            session = sessions.get_current_session()
+            if session:
+                info = await session.try_get_media_properties_async()
+                if info and info.title:
+                    if info.artist:
+                        return f"'{info.title}' by {info.artist}"
+                    return f"'{info.title}'"
+            return None
+            
+        return asyncio.run(_fetch_media())
+    except ImportError:
+        log.debug("winsdk not installed, media tracking unavailable.")
+        return None
+    except Exception as e:
+        log.debug(f"Media fetch failed: {e}")
+        return None
+
+
+# ─── Windows Clipboard Integration ────────────────────────────
+
+def get_clipboard_text() -> str | None:
+    """Uses win32clipboard to peek at text in the clipboard safely."""
+    try:
+        import win32clipboard
+        win32clipboard.OpenClipboard()
+        try:
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                if data and isinstance(data, str):
+                    # Truncate to avoid polluting context window
+                    if len(data) > 120:
+                        return data[:117] + "..."
+                    return data
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception as e:
+        log.debug(f"Clipboard read failed: {e}")
+    return None
+
+
 # ─── Window Title Enrichment ─────────────────────────────────
 
 def _parse_youtube_title(title: str) -> str:
@@ -404,6 +454,17 @@ def get_system_context() -> str:
             stat_parts.append(f"Battery: {stats['battery_percent']}% ({plug})")
         if stat_parts:
             lines.append(f"System: {' | '.join(stat_parts)}")
+
+        # Fetch active media
+        media = get_current_media()
+        if media:
+            lines.append(f"Currently playing media: {media}")
+
+        # Fetch clipboard
+        clipboard = get_clipboard_text()
+        if clipboard:
+            clean_clip = clipboard.replace('\n', ' ').replace('\r', '')
+            lines.append(f"Clipboard contents: '{clean_clip}'")
 
         context = "\n".join(lines)
         log.debug(f"Context built: {len(context)} chars, {len(app_counts)} unique apps, "

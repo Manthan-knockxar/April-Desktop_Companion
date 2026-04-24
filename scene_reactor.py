@@ -13,6 +13,9 @@ import io
 import time
 import re
 import threading
+import json
+import os
+from datetime import datetime
 import ollama
 from PIL import Image
 
@@ -20,6 +23,8 @@ import config
 from logger import Log
 from comeback_templates import get_comeback_style, get_vocabulary_constraint
 from context_resolver import ContextLabel
+from knowledge_base import match_knowledge, format_knowledge_for_prompt
+from personality import personality
 
 log = Log("Reactor")
 
@@ -30,6 +35,62 @@ _ollama_lock = threading.Lock()
 _recent_dialogues: list[str] = []
 MAX_RECENT = 12
 
+# ─── Error Detection Keywords ─────────────────────────────────
+_ERROR_KEYWORDS = [
+    "traceback", "error", "exception", "failed", "syntaxerror",
+    "typeerror", "valueerror", "keyerror", "indexerror", "nameerror",
+    "attributeerror", "importerror", "runtimeerror", "connectionerror",
+    "filenotfounderror", "build failed", "compilation error",
+    "segmentation fault", "stack trace", "undefined", "null pointer",
+    "cannot read", "is not defined", "module not found",
+]
+
+# ─── Emotion Aliases (model outputs → valid sprite emotions) ──
+_EMOTION_ALIASES = {
+    "annoyed": "angry",
+    "irritated": "angry",
+    "frustrated": "angry",
+    "furious": "angry",
+    "curious": "happy",
+    "interested": "happy",
+    "intrigued": "happy",
+    "amused": "smug",
+    "bored": "disappointed",
+    "tired": "disappointed",
+    "concerned": "worried",
+    "anxious": "worried",
+    "nervous": "flustered",
+    "embarrassed": "flustered",
+    "shy": "flustered",
+    "proud": "smug",
+    "satisfied": "smug",
+    "sad": "disappointed",
+    "confused": "flustered",
+}
+
+# ─── Third-Person Phrases (rejection triggers) ───────────────
+_THIRD_PERSON_PHRASES = [
+    "the user ", "the user's ", "the user is", "the user has",
+    "the user was", "the user seems", "the user appears",
+    "the user might", "the user could", "the user should",
+    "it seems like the user", "it appears the user",
+    "the activity is", "the time is",
+]
+
+# ─── Banned Openers (prevent repetitive starts) ──────────────
+_BANNED_OPENER_PATTERNS = [
+    "it's thursday", "another thursday", "thursday morning",
+    "it's monday", "it's tuesday", "it's wednesday", "it's friday",
+    "it's saturday", "it's sunday",
+    "your screen is currently", "the image shows",
+    "the screenshot shows", "the code is",
+]
+
+def _detect_error_context(scene_description: str) -> bool:
+    """Check if the scene description suggests an error/bug is visible."""
+    scene_lower = scene_description.lower()
+    return any(kw in scene_lower for kw in _ERROR_KEYWORDS)
+
 def _build_anti_repeat_section() -> str:
     if not _recent_dialogues:
         return "(No recent lines yet)"
@@ -38,6 +99,35 @@ def _build_anti_repeat_section() -> str:
         words = d.split()[:8]
         lines.append(f"  - {' '.join(words)}...")
     return "\n".join(lines)
+
+def _get_recent_openers() -> set[str]:
+    """Extract first 5 words of recent dialogues for opener diversity check."""
+    openers = set()
+    for d in _recent_dialogues[-6:]:
+        opener = " ".join(d.lower().split()[:5])
+        if opener:
+            openers.add(opener)
+    return openers
+
+
+# ─── Training Data Logger ──────────────────────────────────────
+TRAINING_DIR = "training_data"
+os.makedirs(TRAINING_DIR, exist_ok=True)
+
+def _log_training_data(scene: str, reaction: dict):
+    try:
+        log_file = os.path.join(TRAINING_DIR, "reaction_logs.jsonl")
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "scene_input": scene,
+            "reaction_output": reaction
+        }
+        
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        log.error(f"Failed to log training data: {e}")
+
 
 
 def _downscale_image(image: Image.Image) -> Image.Image:
@@ -101,7 +191,7 @@ def _call_ollama(prompt: str, image: Image.Image | None = None,
                         options={
                             "temperature": temperature,
                             "num_predict": max_tokens,
-                            "num_ctx": 2048,
+                            "num_ctx": 1024 if image is not None else 2048,  # vision needs less context
                             "num_gpu": gpu_layers,
                         },
                     )
@@ -136,11 +226,13 @@ def _stage1_perceive(image: Image.Image, context_label: ContextLabel) -> str | N
     """
     image = _downscale_image(image)
     
-    prompt = f"""Describe what you see on this computer screen in 1-2 sentences.
-Ignore any large black rectangles (those are your own interface).
-Focus on: the main application, what specific content is visible, and what the user appears to be doing.
+    prompt = f"""You are observing the user's screen. 
 Context hint: {context_label.specific_context}
-Keep it factual and under 30 words."""
+Do NOT just state the application name (like "YouTube" or "VSCode"), since the system already knows that.
+Instead, focus heavily on the SPECIFIC content visible on the screen.
+For example, if it's a video, describe the video content, characters, or text. If it's a game, describe what's happening.
+Ignore any large black rectangles (those are your own interface).
+Start directly with your description. Keep it factual and under 40 words."""
 
     return _call_ollama(
         prompt=prompt,
@@ -157,39 +249,49 @@ Keep it factual and under 30 words."""
 
 def _parse_response(text: str, context_label: ContextLabel) -> dict | None:
     """
-    Flexible parser that handles multiple output formats from the 3B model.
+    Flexible parser with quality enforcement.
     
-    The model tends to output in these patterns:
-      Pattern A (ideal):   <<<EMOTION>>> angry <<<ACTION>>> roast <<<REACTION>>> text...
-      Pattern B (common):  <<<ANGRY>>> text... <<<ROAST>>> text... <<<REACTION>>> text...
-      Pattern C (minimal): <<<ANGRY>>> commentary\nActual reaction text here...
+    Post-processing pipeline:
+      1. Extract emotion/action/thought/reaction from <<<TAGS>>>
+      2. Apply emotion aliases (annoyed→angry, curious→happy, etc.)
+      3. Strip action label prefixes from dialogue
+      4. Reject third-person narration ("the user...")
+      5. Reject thought=dialogue duplication
+      6. Truncate overly long dialogues
+      7. Check opener diversity
+      8. Verify "you"/"your" presence
     """
     emotion = "neutral"
     action_type = "commentary"
     reaction = ""
+    thought = ""
     
-    valid_emotions = {"neutral", "angry", "happy", "smug", "flustered", "disappointed", "worried", "confused"}
+    valid_emotions = {"neutral", "angry", "happy", "smug", "flustered", "disappointed", "worried"}
+    all_known_emotions = valid_emotions | set(_EMOTION_ALIASES.keys())
     valid_actions = {"commentary", "roast", "impressed", "concerned", "bored", "curious"}
     
     text_lower = text.lower()
 
     # ── Step 1: Extract emotion ──
-    # Try explicit <<<EMOTION>>> tag first
     m_emo = re.search(r'<<<EMOTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
     if m_emo:
         emo_text = m_emo.group(1).strip().lower()
-        emo_match = re.search(r'\b(' + '|'.join(valid_emotions) + r')\b', emo_text)
+        # Try exact match first, then aliases
+        emo_match = re.search(r'\b(' + '|'.join(all_known_emotions) + r')\b', emo_text)
         if emo_match:
-            emotion = emo_match.group(1)
+            raw_emo = emo_match.group(1)
+            emotion = _EMOTION_ALIASES.get(raw_emo, raw_emo)
     else:
-        # Fallback: check if model used <<<EMOTION_WORD>>> as the tag itself
-        for emo in valid_emotions:
+        for emo in all_known_emotions:
             if f'<<<{emo.upper()}>>>' in text or f'<<<{emo.capitalize()}>>>' in text:
-                emotion = emo
+                emotion = _EMOTION_ALIASES.get(emo, emo)
                 break
 
+    # Ensure emotion is valid (in case alias mapping missed)
+    if emotion not in valid_emotions:
+        emotion = _EMOTION_ALIASES.get(emotion, "neutral")
+
     # ── Step 2: Extract action ──
-    # Try explicit <<<ACTION>>> tag first
     m_act = re.search(r'<<<ACTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
     if m_act:
         act_text = m_act.group(1).strip().lower()
@@ -197,57 +299,133 @@ def _parse_response(text: str, context_label: ContextLabel) -> dict | None:
         if act_match:
             action_type = act_match.group(1)
     else:
-        # Fallback: check if model used <<<ACTION_WORD>>> as the tag, or scan text
         for act in valid_actions:
             if f'<<<{act.upper()}>>>' in text or f'<<<{act.capitalize()}>>>' in text:
                 action_type = act
                 break
-        # Also check for action word appearing right after an emotion tag line
         act_scan = re.search(r'\b(' + '|'.join(valid_actions) + r')\b', text_lower)
         if act_scan:
             action_type = act_scan.group(1)
 
-    # ── Step 3: Extract reaction text ──
-    # Try explicit <<<REACTION>>> tag first
+    # ── Step 3: Extract thought (for logging + dedup check) ──
+    m_thought = re.search(r'<<<THOUGHT>>>(.*?)(?=<<<|$)', text, re.DOTALL)
+    if m_thought:
+        thought = m_thought.group(1).strip()
+
+    # ── Step 4: Extract reaction text ──
     m_react = re.search(r'<<<REACTION>>>(.*?)(?=<<<|$)', text, re.DOTALL)
     if m_react:
         reaction = m_react.group(1).strip()
     else:
-        # Fallback: grab the longest paragraph of actual dialogue
-        # Strip all <<<TAG>>> markers and their single-word values, keep the rest
         cleaned = re.sub(r'<<<[^>]+>>>', '\n', text)
-        # Remove standalone emotion/action words on their own line
         lines = []
         for line in cleaned.split('\n'):
             stripped = line.strip()
-            # Skip lines that are just a single emotion/action word
             if stripped.lower() in valid_emotions or stripped.lower() in valid_actions:
                 continue
-            # Skip empty lines and very short fragments
+            if stripped.lower() in all_known_emotions:
+                continue
             if len(stripped) > 10:
                 lines.append(stripped)
         if lines:
-            # Take the longest line as the reaction
             reaction = max(lines, key=len)
     
-    # Clean up the reaction
+    # ══════════════════════════════════════════════════════════
+    # POST-PROCESSING QUALITY PIPELINE
+    # ══════════════════════════════════════════════════════════
+    
+    # Clean up basics
     reaction = reaction.replace('**', '').replace('"', '').strip()
     
+    # Fix 5: Strip action label prefixes ("Commentary: ...", "roast: ...")
+    for label in list(valid_actions) + ["reaction"]:
+        if reaction.lower().startswith(f"{label}:"):
+            reaction = reaction[len(label) + 1:].strip()
+        elif reaction.lower().startswith(f"{label} :"):
+            reaction = reaction[len(label) + 2:].strip()
+    # Strip leading colons/dashes
+    reaction = re.sub(r'^[:\-–—]\s*', '', reaction).strip()
+    
     if not reaction:
-        log.warn("Parse failed — no reaction text found in any format")
+        log.warn("Parse failed — no reaction text found")
         return None
 
+    # Fix 1: Reject third-person narration
+    reaction_lower = reaction.lower()
+    has_third_person = any(phrase in reaction_lower for phrase in _THIRD_PERSON_PHRASES)
+    if has_third_person:
+        log.warn(f"Rejected third-person dialogue: '{reaction[:80]}...'")
+        # Try to salvage: if there's a second sentence, use it
+        sentences = re.split(r'[.!?]+\s+', reaction)
+        salvaged = None
+        for s in sentences[1:]:
+            s = s.strip()
+            s_lower = s.lower()
+            if len(s) > 15 and not any(p in s_lower for p in _THIRD_PERSON_PHRASES):
+                salvaged = s
+                break
+        if salvaged:
+            reaction = salvaged
+            log.info(f"Salvaged sentence: '{reaction[:60]}'")
+        else:
+            return None  # Total reject — will retry
+
+    # Fix 2: Reject thought=dialogue duplication
+    if thought and reaction:
+        # Compare first 40 chars (normalized)
+        t_norm = thought.lower().strip()[:40]
+        r_norm = reaction.lower().strip()[:40]
+        if t_norm and r_norm and (t_norm == r_norm or t_norm in r_norm or r_norm in t_norm):
+            log.warn(f"Rejected thought-as-dialogue duplication")
+            return None
+
+    # Fix 4: Check banned openers
+    reaction_opener = reaction.lower().strip()
+    for banned in _BANNED_OPENER_PATTERNS:
+        if reaction_opener.startswith(banned):
+            log.warn(f"Rejected banned opener: '{banned}'")
+            return None
+
+    # Fix 7: Opener diversity check
+    new_opener = " ".join(reaction.lower().split()[:5])
+    recent_openers = _get_recent_openers()
+    if new_opener in recent_openers:
+        log.warn(f"Rejected duplicate opener: '{new_opener}'")
+        return None
+
+    # Fix 6: Truncate overly long dialogues to ~2 sentences
+    words = reaction.split()
+    if len(words) > 45:
+        sentences = re.split(r'([.!?]+\s+)', reaction)
+        truncated = ""
+        for i in range(0, len(sentences), 2):  # pairs of (sentence, delimiter)
+            chunk = sentences[i]
+            if i + 1 < len(sentences):
+                chunk += sentences[i + 1]
+            if len((truncated + chunk).split()) > 40:
+                break
+            truncated += chunk
+        if truncated.strip():
+            reaction = truncated.strip()
+            log.debug(f"Truncated dialogue from {len(words)} to {len(reaction.split())} words")
+
+    # Fix 8: "You"/"your" enforcement — soft check (warn, don't reject)
+    if "you" not in reaction.lower():
+        log.debug("Dialogue missing 'you/your' — may lack direct address")
+
+    # Final length check
     words = reaction.split()
     if len(words) < 5 or len(words) > 80:
         log.warn(f"Parse failed — word count {len(words)} out of bounds")
         return None
     
-    # Normalize confused → neutral (not a valid sprite)
+    # Normalize confused → flustered
     if emotion == "confused":
-        emotion = "neutral"
+        emotion = "flustered"
 
     return {
-        "scene": "",  # Will be filled by caller from Stage 1
+        "scene": "",
+        "thought": thought,
         "emotion": emotion,
         "action_type": action_type,
         "dialogue": reaction,
@@ -265,10 +443,27 @@ def _stage2_react(
     system_context: str = "",
     subtitle_buffer: list[str] | None = None,
     session_narrative: str = "",
+    error_detected: bool = False,
+    break_severity: str | None = None,
+    is_distraction: bool = False,
+    action_cancelled: tuple[bool, str] = (False, ""),
+    pending_action: str | None = None,
+    schedule_status: str = "",
+    screen_text: str = "",
+    knowledge_context: str = "",
+    personality_brief: str = "",
 ) -> dict | None:
     """
     Send the scene description + full personality prompt to the fast text model.
     Returns a structured reaction with emotion, action, and dialogue.
+    
+    Now supports:
+    - error_detected: inject bug analysis instruction
+    - break_severity: inject break warning/demand
+    - is_distraction: inject distraction callout (Pomodoro)
+    - action_cancelled: inject annoyance about cancelled action
+    - pending_action: inject action announcement into dialogue
+    - schedule_status: active timers/pomodoro info
     """
     time_str = time_context.get("time_string", "Unknown time")
     
@@ -287,13 +482,60 @@ def _stage2_react(
     if novelty_flag:
         curious_rule = "\n- CURIOSITY: You've never seen this before. ACTION must be 'curious'. Ask what it is."
 
-    prompt = f"""You are April, a tsundere anime girl living on a user's desktop. You are sharp-tongued, dramatic, and secretly caring. You speak directly TO the user using "you". 
+    # ── April 2.0: Dynamic context injections ──
+    error_rule = ""
+    if error_detected:
+        error_rule = """\n- BUG DETECTED: You can see an error/traceback on screen. React to the specific error you see.
+  Mention what the error likely is and give a quick hint about the fix, but wrapped in your sassy tone.
+  Example: 'Oh great, a TypeError. You're passing a string where it wants an int, genius.'"""
+
+    break_rule = ""
+    if break_severity == "warning":
+        break_rule = "\n- BREAK WARNING: The user has been coding for over 90 minutes straight. Express concern. Tell them to take a break, but reluctantly like you care."
+    elif break_severity == "demand":
+        break_rule = "\n- BREAK DEMAND: The user has been coding for over 2 HOURS without stopping. Be AGGRESSIVE. Demand they take a break NOW. You're genuinely worried but express it through anger."
+
+    distraction_rule = ""
+    if is_distraction:
+        distraction_rule = "\n- FOCUS VIOLATION: The user is supposed to be working (Pomodoro active) but they switched to something unproductive. Call them out HARD. They're wasting their own focus session."
+
+    cancelled_rule = ""
+    was_cancelled, cancelled_label = action_cancelled
+    if was_cancelled:
+        cancelled_rule = f"\n- ACTION CANCELLED: You just tried to {cancelled_label} but the user pressed Ctrl+Shift+X to cancel it. Be ANNOYED that they stopped you. You were trying to help!"
+
+    action_rule = ""
+    if pending_action:
+        action_rule = f"""\n- PENDING ACTION: You are about to {pending_action}. Work this into your dialogue NATURALLY.
+  Don't say 'I will now execute action X'. Instead, say something like 'Hmph, I'm {pending_action} whether you like it or not!'
+  The action is part of your reaction, not a separate announcement."""
+
+    schedule_note = ""
+    if schedule_status:
+        schedule_note = f"\nSCHEDULE: {schedule_status}"
+
+    # OCR text injection — actual text from the screen
+    screen_text_section = ""
+    if screen_text:
+        screen_text_section = f"\nACTUAL TEXT ON SCREEN (from OCR — this is what's REALLY written): {screen_text}"
+
+    prompt = f"""You are April, a tsundere anime girl living on a user's desktop. You are sharp-tongued, dramatic, and secretly caring.
+
+{personality_brief}
+
+CRITICAL RULES:
+- ALWAYS talk directly TO the user using "you" and "your". NEVER say "the user" or narrate in third person.
+- Your REACTION must be DIFFERENT from your THOUGHT. The thought is your inner reasoning. The reaction is what you SAY OUT LOUD.
+- You MUST mention at least ONE specific detail from the screen (a name, title, color, filename, text snippet). Generic reactions are FORBIDDEN.
+- Do NOT start with the day of the week ("It's Thursday...", "Another Monday..."). Jump straight into your reaction.
+- Do NOT prefix your reaction with labels like "Commentary:" or "Roast:".
+- Stick to your PERSONALITY BIASES mentioned in your brief.
 NOTE: You are a desktop companion. If there's a black box in your vision, that's just your own UI being masked out—ignore it.
 
-WHAT YOU SEE: {scene_description}
+WHAT YOU SEE: {scene_description}{screen_text_section}
 TIME: {time_str}
 ACTIVITY: {context_label.specific_context}
-{personality_note}{subs_str}{callback_str}
+{personality_note}{subs_str}{callback_str}{schedule_note}{knowledge_context}
 
 STYLE: {style_hint}
 VOCAB: {vocab_hint}
@@ -301,24 +543,43 @@ VOCAB: {vocab_hint}
 DO NOT REPEAT THESE RECENT LINES:
 {_build_anti_repeat_section()}
 
+SPECIAL RULES:{error_rule}{break_rule}{distraction_rule}{cancelled_rule}{action_rule}{curious_rule}
+
 OUTPUT FORMAT — use these EXACT delimiters, nothing else:
+<<<THOUGHT>>> 1-2 sentences of INTERNAL reasoning about what you see. This is private — the user won't hear this.
 <<<EMOTION>>> one word: neutral/angry/happy/smug/flustered/disappointed/worried
 <<<ACTION>>> one word: commentary/roast/impressed/concerned/bored/curious
-<<<REACTION>>> 15-35 words. Talk TO the user about what you see. Be specific. Be sassy.{curious_rule}"""
+<<<REACTION>>> 15-35 words. What you SAY OUT LOUD to the user. Must use "you"/"your". Must reference something specific on screen. Be sassy."""
 
-    text = _call_ollama(
-        prompt=prompt.strip(),
-        image=None,
-        temperature=config.OLLAMA_REACT_TEMPERATURE,
-        max_tokens=150,
-        tag="React",
-        model_override=config.OLLAMA_TEXT_MODEL,
-    )
+    # Retry loop: quality pipeline may reject low-quality outputs
+    max_quality_retries = 2
+    for quality_attempt in range(1, max_quality_retries + 1):
+        temp = config.OLLAMA_REACT_TEMPERATURE
+        if quality_attempt > 1:
+            temp = min(temp + 0.15, 1.0)  # Bump temperature on retry
+            log.info(f"[React] Quality retry #{quality_attempt} (temp={temp:.2f})")
 
-    if not text:
-        return None
+        text = _call_ollama(
+            prompt=prompt.strip(),
+            image=None,
+            temperature=temp,
+            max_tokens=220,
+            tag="React",
+            model_override=config.OLLAMA_TEXT_MODEL,
+        )
 
-    return _parse_response(text, context_label)
+        if not text:
+            return None
+
+        result = _parse_response(text, context_label)
+        if result is not None:
+            return result
+        
+        if quality_attempt < max_quality_retries:
+            log.warn(f"[React] Quality filter rejected output — retrying ({quality_attempt}/{max_quality_retries})")
+
+    log.warn("[React] All quality retries exhausted — no usable reaction")
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -336,6 +597,13 @@ def analyze_and_react(
     system_context: str = "",
     subtitle_buffer: list[str] | None = None,
     session_narrative: str = "",
+    error_detected: bool = False,
+    break_severity: str | None = None,
+    is_distraction: bool = False,
+    action_cancelled: tuple[bool, str] = (False, ""),
+    pending_action: str | None = None,
+    schedule_status: str = "",
+    screen_text: str = "",
 ) -> dict | None:
     """
     Two-Stage Pipeline:
@@ -354,6 +622,29 @@ def analyze_and_react(
     
     log.success(f"Scene: {scene_description[:120]}")
 
+    # Auto-detect errors if feature is enabled
+    if config.PROACTIVE_BUG_DETECTION and not error_detected:
+        error_detected = _detect_error_context(scene_description)
+        if error_detected:
+            log.info("🐛 Error detected in scene — activating bug analysis mode")
+
+    # Also check OCR text for errors
+    if config.PROACTIVE_BUG_DETECTION and not error_detected and screen_text:
+        error_detected = _detect_error_context(screen_text)
+        if error_detected:
+            log.info("🐛 Error detected in OCR text — activating bug analysis mode")
+
+    # Match domain knowledge from OCR text + scene
+    combined_text = f"{scene_description} {screen_text}"
+    knowledge_matches = match_knowledge(combined_text)
+    knowledge_context = format_knowledge_for_prompt(knowledge_matches)
+    if knowledge_matches:
+        log.info(f"📚 Matched {len(knowledge_matches)} knowledge entries")
+
+    # Update Personality/Mood
+    personality.update_mood_from_text(combined_text)
+    personality_brief = personality.get_personality_brief()
+
     # ── Stage 2: Personality ──
     log.info("═══ Stage 2: Personality (Text) ═══")
     result = _stage2_react(
@@ -367,6 +658,15 @@ def analyze_and_react(
         system_context=system_context,
         subtitle_buffer=subtitle_buffer,
         session_narrative=session_narrative,
+        error_detected=error_detected,
+        break_severity=break_severity,
+        is_distraction=is_distraction,
+        action_cancelled=action_cancelled,
+        pending_action=pending_action,
+        schedule_status=schedule_status,
+        screen_text=screen_text,
+        knowledge_context=knowledge_context,
+        personality_brief=personality_brief,
     )
 
     if result:
@@ -378,6 +678,9 @@ def analyze_and_react(
             _recent_dialogues.append(result["dialogue"])
             if len(_recent_dialogues) > MAX_RECENT:
                 _recent_dialogues.pop(0)
+            
+            _log_training_data(scene_description, result)
+
         return result
 
     return None
@@ -425,6 +728,47 @@ Answer in 1-2 sentences. Be helpful but sassy."""
         return {
             "scene": scene or "",
             "emotion": "neutral",
+            "action_type": "commentary",
+            "dialogue": text.replace('**', '').replace('"', ''),
+        }
+    return None
+
+
+def summarize_current_page(image: Image.Image, system_context: str = "") -> dict | None:
+    """
+    TL;DR function: Analyze the currently visible page content
+    and return a summary wrapped in April's personality.
+    """
+    scene = _stage1_perceive(image, ContextLabel(
+        category="unknown",
+        specific_context="User requested a summary",
+        focus_instruction="Read ALL visible text on the screen carefully. Include headings, body text, code, and key details.",
+        intent="unknown",
+    ))
+    
+    if not scene:
+        return None
+
+    prompt = f"""You are April, a tsundere anime girl on the user's desktop. The user asked you to summarize what's on their screen.
+
+WHAT YOU SEE: {scene}
+SYSTEM: {system_context}
+
+Give a concise but thorough summary of the page content (3-5 sentences). Be helpful but stay in character — you can be sassy about the content but the summary itself must be accurate and useful."""
+
+    text = _call_ollama(
+        prompt=prompt.strip(),
+        image=None,
+        temperature=0.5,
+        max_tokens=250,
+        tag="Summary",
+        model_override=config.OLLAMA_TEXT_MODEL,
+    )
+    
+    if text:
+        return {
+            "scene": scene,
+            "emotion": "smug",
             "action_type": "commentary",
             "dialogue": text.replace('**', '').replace('"', ''),
         }

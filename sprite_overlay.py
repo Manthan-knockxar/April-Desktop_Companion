@@ -90,6 +90,10 @@ class SpriteOverlay:
         self._context_menu = None       # right-click popup
         self._mute_callback = None      # callback to notify main of mute state
 
+        # ─── Action cancel state ──────────────────────────────
+        self._action_cancelled = False    # set True when user cancels a pending action
+        self._cancel_hotkey_active = False # True while an action countdown is live
+
     # ══════════════════════════════════════════════════════════
     #  Startup
     # ══════════════════════════════════════════════════════════
@@ -645,7 +649,12 @@ class SpriteOverlay:
             self._root.after(80, self._check_pending)
 
     def _apply_update(self, update: dict):
-        """Apply a pending update on the Tk thread."""
+        """Apply a pending update on the Tk thread.
+        
+        Phase 1 ONLY: Updates sprite expression and stores dialogue.
+        Dialogue text is NOT shown yet — it waits for start_dialogue().
+        This prevents subtitles from appearing before TTS audio plays.
+        """
         emotion = update.get("emotion", "neutral")
         dialogue = update.get("dialogue", "")
         action_type = update.get("action_type", "commentary")
@@ -673,23 +682,45 @@ class SpriteOverlay:
             is_talking=False,
         )
 
-        # Set idle sprite first
+        # Set idle sprite — expression updates immediately
         self._set_sprite(idle_expr)
 
-        # Update dialogue text and resize window to fit
+        # Store params for lip sync (started later by start_dialogue)
+        self._pending_lip_sync_params = (emotion, action_type, emotional_intensity, dialogue)
+
+        # Safety net: if start_dialogue() / end_dialogue() is never called
+        # (e.g. TTS crash), clear stale dialogue after a long timeout
+        self._hide_text_job = self._root.after(
+            config.OVERLAY_DISPLAY_SECONDS * 3 * 1000,
+            self._on_text_timeout,
+        )
+
+    def _apply_start_dialogue(self):
+        """Phase 2: Show the stored dialogue text and start lip sync.
+        Called when TTS audio is about to play (or immediately if muted)."""
+        dialogue = self._current_dialogue
+        if not dialogue:
+            return
+
+        # Cancel safety net timer — we're now controlled by end_dialogue()
+        if self._hide_text_job:
+            self._root.after_cancel(self._hide_text_job)
+            self._hide_text_job = None
+
+        # Show dialogue text and resize window
         if self._text_label and dialogue:
             self._text_label.config(text=dialogue)
             self._resize_for_text()
 
         # Start lip sync animation
-        self._is_talking = True
-        self._start_lip_sync(emotion, action_type, emotional_intensity, dialogue)
+        if hasattr(self, '_pending_lip_sync_params') and self._pending_lip_sync_params:
+            emotion, action_type, emotional_intensity, dialogue = self._pending_lip_sync_params
+            self._is_talking = True
+            self._start_lip_sync(emotion, action_type, emotional_intensity, dialogue)
 
-        # Schedule text clear (but sprite stays visible with neutral expression)
-        self._hide_text_job = self._root.after(
-            config.OVERLAY_DISPLAY_SECONDS * 1000,
-            self._on_text_timeout,
-        )
+    def _apply_end_dialogue(self):
+        """Phase 3: Clear dialogue text after TTS playback finishes."""
+        self._on_text_timeout()
 
     # ══════════════════════════════════════════════════════════
     #  Window Resizing (respects user-chosen position)
@@ -808,8 +839,9 @@ class SpriteOverlay:
              action_type: str = "commentary",
              emotional_intensity: str = "DEFAULT_TSUNDERE"):
         """
-        Thread-safe method to display a reaction with the correct sprite.
-        Called from the main loop or TTS worker thread.
+        Thread-safe method to update sprite expression for a new reaction.
+        NOTE: This only updates the sprite. Dialogue text is NOT shown yet.
+        Call start_dialogue() when TTS audio is about to play.
         """
         if not self._running:
             return
@@ -819,6 +851,17 @@ class SpriteOverlay:
             "action_type": action_type,
             "emotional_intensity": emotional_intensity,
         }
+
+    def start_dialogue(self):
+        """Thread-safe: Show the stored dialogue text and start lip sync.
+        Called by TTS worker right before audio playback begins."""
+        if self._root:
+            self._root.after(0, self._apply_start_dialogue)
+
+    def end_dialogue(self):
+        """Thread-safe: Clear dialogue text after TTS playback ends."""
+        if self._root:
+            self._root.after(0, self._apply_end_dialogue)
 
     @property
     def muted(self) -> bool:
@@ -839,6 +882,19 @@ class SpriteOverlay:
     def set_mute_callback(self, callback):
         """Set a callback to be invoked when mute state changes."""
         self._mute_callback = callback
+
+    @property
+    def action_cancelled(self) -> bool:
+        """Thread-safe: check if a pending action was cancelled by user."""
+        return self._action_cancelled
+
+    def clear_action_cancel(self):
+        """Thread-safe: reset the cancel flag after it's been consumed."""
+        self._action_cancelled = False
+
+    def set_cancel_hotkey_active(self, active: bool):
+        """Thread-safe: flag that an action countdown is live (shows cancel hint)."""
+        self._cancel_hotkey_active = active
 
     def stop(self):
         """Stop the overlay."""

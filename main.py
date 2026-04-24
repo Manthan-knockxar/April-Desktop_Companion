@@ -58,12 +58,14 @@ import title_ocr
 import context_resolver
 from subtitle_ocr import SubtitleOCR
 from context_memory import ContextMemory, get_time_context
-from scene_reactor import analyze_and_react, answer_user_question
+from scene_reactor import analyze_and_react, answer_user_question, summarize_current_page
 from tts_engine import init_tts, synthesize
-from audio_player import play_audio, stop as stop_audio
+from audio_player import play_audio, play_audio_blocking, stop as stop_audio
 from sprite_overlay import SpriteOverlay
 from system_info import get_system_context, get_enriched_context
 from screen_capture import capture_screen, has_significant_change
+from schedule_manager import ScheduleManager
+import system_actions
 from logger import Log, PINK, CYAN, YELLOW, DIM, BOLD, RESET
 
 # Module loggers
@@ -86,16 +88,23 @@ BANNER = f"""
 
 _overlay_ref: SpriteOverlay | None = None  # set in main() for mute checks
 
-def _tts_worker(dialogue: str, action_type: str):
+def _tts_worker(dialogue: str, action_type: str, overlay_ref=None):
     """
     Synthesize and play audio in a background thread.
-    This prevents TTS from blocking the main capture loop.
-    Respects overlay mute toggle — skips playback when muted.
+    Subtitle sync: dialogue text appears ONLY when audio starts playing,
+    and clears when audio finishes. No more early subtitle flash.
     """
     try:
         # Check mute state before synthesizing
         if _overlay_ref and _overlay_ref.muted:
-            log_tts.info("Voice muted — skipping TTS")
+            log_tts.info("Voice muted — showing subtitle as text-only")
+            # Muted: show text immediately, hold for a reasonable time, then clear
+            ov = overlay_ref or _overlay_ref
+            if ov:
+                ov.start_dialogue()
+                import time as _time
+                _time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                ov.end_dialogue()
             return
 
         log_tts.info(f"Synthesizing: \"{dialogue[:60]}...\"")
@@ -104,18 +113,48 @@ def _tts_worker(dialogue: str, action_type: str):
         if audio_bytes:
             # Re-check mute in case it changed during synthesis
             if _overlay_ref and _overlay_ref.muted:
-                log_tts.info("Voice muted during synthesis — skipping playback")
+                log_tts.info("Voice muted during synthesis — showing text-only")
+                ov = overlay_ref or _overlay_ref
+                if ov:
+                    ov.start_dialogue()
+                    import time as _time
+                    _time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                    ov.end_dialogue()
                 return
             size_kb = len(audio_bytes) / 1024
             log_tts.success(f"Got {audio_format.upper()} audio — {size_kb:.1f}KB")
+
+            # ── Subtitle Sync: show text RIGHT BEFORE audio plays ──
+            ov = overlay_ref or _overlay_ref
+            if ov:
+                ov.start_dialogue()
+
             log_tts.info("Playing audio...")
             with log_tts.timed("Audio playback"):
-                play_audio(audio_bytes, audio_format)
+                play_audio_blocking(audio_bytes, audio_format)
             log_tts.success("Playback finished")
+
+            # ── Subtitle Sync: clear text AFTER audio ends ──
+            if ov:
+                ov.end_dialogue()
         else:
-            log_tts.error("Synthesis returned no audio — dialogue shown as text only")
+            log_tts.error("Synthesis returned no audio — showing text-only")
+            # Fallback: show subtitle anyway since there's no audio
+            ov = overlay_ref or _overlay_ref
+            if ov:
+                ov.start_dialogue()
+                import time as _time
+                _time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                ov.end_dialogue()
     except Exception as e:
         log_tts.error("TTS worker crashed", exc=e)
+        # Safety: try to clear any stuck subtitle
+        try:
+            ov = overlay_ref or _overlay_ref
+            if ov:
+                ov.end_dialogue()
+        except Exception:
+            pass
 
 
 # ─── Background Context Worker (Silent) ──────────────────────
@@ -123,6 +162,7 @@ def _tts_worker(dialogue: str, action_type: str):
 _accumulated_scenes: list[str] = []
 _accumulated_lock = threading.Lock()
 _question_event = threading.Event()  # signaled when a user question arrives
+_scheduler: ScheduleManager | None = None  # global scheduler reference
 
 def _context_worker():
     """
@@ -312,6 +352,13 @@ def main():
     memory = ContextMemory()
     subtitle_thread = SubtitleOCR(memory)
 
+    # Initialize schedule manager
+    global _scheduler
+    scheduler = ScheduleManager()
+    scheduler.start()
+    _scheduler = scheduler
+    log_main.success("Schedule manager started (timers, Pomodoro, reminders)")
+
     # Log configuration
     log_main.info(f"Config: capture_interval={config.CAPTURE_INTERVAL}s, react_interval={config.REACT_INTERVAL}s")
     log_main.info(f"Config: vision={config.OLLAMA_MODEL}, text={config.OLLAMA_TEXT_MODEL}, gpu_layers={config.OLLAMA_NUM_GPU}")
@@ -344,6 +391,17 @@ def main():
             # ── Step 2: Full reaction cycle ──
             log_main.info(f"═══ Reaction #{reaction_count} ═══")
 
+            # Start OCR immediately — runs on CPU in parallel with everything below
+            ocr_result = {"text": ""}
+            def _run_ocr():
+                try:
+                    ocr_result["text"] = title_ocr.ocr_screen_text(image)
+                except Exception as e:
+                    log_main.debug(f"OCR failed (non-fatal): {e}")
+            
+            ocr_thread = threading.Thread(target=_run_ocr, daemon=True)
+            ocr_thread.start()
+
             # Get thread-safe copy of accumulated scenes (do NOT clear yet)
             with _accumulated_lock:
                 current_scenes = list(_accumulated_scenes)
@@ -369,6 +427,9 @@ def main():
             # Phase 10: State Updates
             memory.update_activity(context_label.intent, context_label.specific_context)
             
+            # April 2.0: Tick productivity tracker
+            memory.tick_productivity(context_label.intent)
+            
             novelty_flag = context_label.specific_context not in memory.seen_contexts
             if novelty_flag:
                 memory.seen_contexts.add(context_label.specific_context)
@@ -382,7 +443,23 @@ def main():
 
             log_main.info(f"🎯 Activity: {context_label.specific_context} (Intent: {context_label.intent})")
             log_main.info(f"Memory state: affection={memory.affection}, streak={memory.roast_streak}, "
-                          f"duration={memory.get_activity_duration()}m, total={memory.total_interactions}")
+                          f"duration={memory.get_activity_duration()}m, total={memory.total_interactions}, "
+                          f"focus={memory.focus_score:.0%}")
+
+            # April 2.0: Proactive feature checks
+            break_severity = scheduler.check_break_needed(
+                context_label.intent, memory.get_activity_duration()
+            )
+            is_distraction = scheduler.check_distraction(context_label.intent)
+            action_cancelled = memory.consume_action_cancelled()
+            schedule_status = scheduler.get_status_summary()
+
+            # Determine if April should announce a pending action
+            pending_action = None
+            if is_distraction and scheduler.focus_violations >= 3:
+                pending_action = "pause your media"
+            elif break_severity == "demand":
+                pending_action = "pause your media to get your attention"
 
             # Boredom suppression check
             is_similar_now = memory.similar_scene_streak >= 3
@@ -390,6 +467,11 @@ def main():
                 log_main.debug("Skipping reaction — boredom suppression active")
                 time.sleep(config.REACT_INTERVAL)
                 continue
+
+            # Wait for OCR to finish (started right after capture — should be done by now)
+            ocr_thread.join(timeout=10)
+            if ocr_result["text"]:
+                log_main.info(f"📝 OCR: '{ocr_result['text'][:80]}...'")
 
             result = analyze_and_react(
                 image=image,
@@ -401,7 +483,13 @@ def main():
                 emotional_intensity=memory.get_emotional_intensity(),
                 system_context=system_context,
                 subtitle_buffer=list(memory.subtitle_buffer),
-                session_narrative=memory.get_context_summary()
+                session_narrative=memory.get_context_summary(),
+                break_severity=break_severity,
+                is_distraction=is_distraction,
+                action_cancelled=action_cancelled,
+                pending_action=pending_action,
+                schedule_status=schedule_status,
+                screen_text=ocr_result["text"],
             )
 
             if result is None:
@@ -455,53 +543,265 @@ def main():
                 )
                 log_main.debug(f"Sprite updated: emotion={emotion}")
 
-            # Fire-and-forget TTS in background thread
+            # Fire-and-forget TTS in background thread (passes overlay for subtitle sync)
             tts_thread = threading.Thread(
                 target=_tts_worker,
                 args=(dialogue, action_type),
+                kwargs={"overlay_ref": overlay},
                 daemon=True,
             )
             tts_thread.start()
             log_main.debug("TTS thread dispatched")
 
-            # Wait for the next reaction cycle, but poll for user questions
+            # April 2.0: Execute pending action after TTS starts
+            # The action was already announced in the dialogue — now we do the countdown
+            if pending_action:
+                log_main.info(f"Action announced: '{pending_action}' — starting {config.ACTION_ANNOUNCE_DELAY}s countdown")
+                action_key = _resolve_action_key(pending_action)
+                if action_key:
+                    system_actions.execute_action_async(action_key, overlay)
+
+            # Wait for the next reaction cycle, but poll for user questions + schedule events
             log_main.debug(f"Waiting {config.REACT_INTERVAL}s until next reaction (polling for questions)...")
-            _wait_and_poll(overlay, memory)
+            _wait_and_poll(overlay, memory, scheduler)
 
     except KeyboardInterrupt:
         print(f"\n{PINK}♡ B-bye... it's not like I'll miss watching your screen or anything! ♡{RESET}\n")
         if overlay:
             overlay.stop()
+        if scheduler:
+            scheduler.stop()
         stop_audio()
         sys.exit(0)
 
 
-def _wait_and_poll(overlay, memory):
+def _resolve_action_key(pending_action: str) -> str | None:
+    """Map a pending action description to an ACTION_REGISTRY key."""
+    action_lower = pending_action.lower()
+    if "pause" in action_lower:
+        return "pause_media"
+    if "play" in action_lower or "resume" in action_lower:
+        return "play_media"
+    if "mute" in action_lower:
+        return "mute_volume"
+    if "volume down" in action_lower or "turn down" in action_lower:
+        return "volume_down"
+    if "volume up" in action_lower or "turn up" in action_lower:
+        return "volume_up"
+    if "next" in action_lower or "skip" in action_lower:
+        return "next_track"
+    return None
+
+
+def _wait_and_poll(overlay, memory, scheduler=None):
     """
     Wait for REACT_INTERVAL seconds, using an Event for efficient sleep.
     If a question comes in (via the event), process it immediately,
     then reset the timer so the next auto-reaction doesn't fire right after.
+    Also polls schedule manager for fired events.
     """
     remaining = config.REACT_INTERVAL
     while remaining > 0:
         _question_event.clear()
         # Wait efficiently — wakes up on question event OR timeout
-        triggered = _question_event.wait(timeout=remaining)
+        triggered = _question_event.wait(timeout=min(remaining, 1.0))
+        remaining -= 1.0
+        
+        # Check for user questions
         if triggered and overlay:
             question = overlay.get_pending_question()
             if question:
-                _handle_user_question(question, overlay, memory)
+                _handle_user_question(question, overlay, memory, scheduler)
                 # Reset timer after answering
                 remaining = config.REACT_INTERVAL
                 continue
-        break
+
+        # Check for schedule events
+        if scheduler:
+            for label, callback in scheduler.get_pending_callbacks():
+                log_main.info(f"⏰ Schedule event: {label}")
+                try:
+                    callback()
+                except Exception as e:
+                    log_main.error(f"Schedule callback failed: {label}", exc=e)
+
+        # Check if an action was cancelled (set cancel memory for next reaction)
+        if overlay and overlay.action_cancelled:
+            overlay.clear_action_cancel()
+            memory.record_action_cancelled("an action")
+            log_main.info("User cancelled a pending action — will be annoyed next reaction")
+
+        if remaining <= 0:
+            break
 
 
-def _handle_user_question(question: str, overlay, memory):
-    """Process a direct user question via the chat input."""
+def _handle_user_question(question: str, overlay, memory, scheduler=None):
+    """Process a direct user question via the chat input.
+    
+    April 2.0: Now supports command parsing for:
+    - 'summarize' / 'tldr' → page summarization
+    - 'set timer' / 'remind me' → schedule a timer/reminder
+    - 'pause' / 'play' / 'mute' → media control (with announce-and-act)
+    - 'pomodoro' / 'focus' → start/stop Pomodoro
+    - 'cancel timer' → cancel active timer
+    - 'daily report' / 'how did i do' → productivity report
+    - Otherwise → standard Q&A
+    """
     log_main.reaction("💬", f"{PINK}User asked: \"{question}\"{RESET}")
+    q_lower = question.lower().strip()
 
-    # Capture fresh screenshot for context
+    # ─── Command: Summarize / TL;DR ──────────────────────────
+    if any(kw in q_lower for kw in ["summarize", "tldr", "tl;dr", "summary", "what does this say", "what's on screen"]):
+        log_main.info("Command detected: Summarize current page")
+        try:
+            image = capture_screen()
+            system_context = get_system_context()
+            result = summarize_current_page(image, system_context)
+            if result:
+                _speak_result(result, overlay, memory)
+                return
+        except Exception as e:
+            log_main.error("Summarization failed", exc=e)
+        if overlay:
+            overlay.show("Tch, I couldn't read that page properly. Try scrolling up.", "angry", "roast")
+            overlay.start_dialogue()
+            time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+            overlay.end_dialogue()
+        return
+
+    # ─── Command: Set Timer / Reminder ────────────────────────
+    if any(kw in q_lower for kw in ["set timer", "remind me", "set a timer", "set an alarm", "reminder"]):
+        if scheduler:
+            minutes = _extract_minutes(q_lower)
+            if minutes and minutes > 0:
+                def _on_timer_fire():
+                    if overlay:
+                        overlay.show(
+                            f"⏰ Hey! Your {minutes:.0f}-minute timer is up!",
+                            "angry", "concerned",
+                        )
+                        overlay.start_dialogue()
+                scheduler.set_timer(f"User timer ({minutes:.0f}m)", minutes, _on_timer_fire)
+                if overlay:
+                    overlay.show(f"Fine, I set a {minutes:.0f}-minute timer. Don't blame me when it goes off.", "smug", "commentary")
+                    overlay.start_dialogue()
+                    time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                    overlay.end_dialogue()
+                return
+            else:
+                if overlay:
+                    overlay.show("How many minutes? Say something like 'set timer 30 minutes'.", "confused", "commentary")
+                    overlay.start_dialogue()
+                    time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                    overlay.end_dialogue()
+                return
+        return
+
+    # ─── Command: Pomodoro ────────────────────────────────────
+    if any(kw in q_lower for kw in ["pomodoro", "focus mode", "start focus", "focus session"]):
+        if scheduler:
+            if "stop" in q_lower or "cancel" in q_lower:
+                if scheduler.stop_pomodoro():
+                    if overlay:
+                        overlay.show("Fine, Pomodoro cancelled. Your lack of discipline is noted.", "disappointed", "commentary")
+                        overlay.start_dialogue()
+                        time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                        overlay.end_dialogue()
+                return
+            
+            work_mins = _extract_minutes(q_lower) or config.POMODORO_DEFAULT_WORK
+            
+            def _on_work_end():
+                if overlay:
+                    overlay.show("Time's up! Take a break... and I mean actually step away from the screen.", "concerned", "concerned")
+                    overlay.start_dialogue()
+            
+            def _on_break_end():
+                if overlay:
+                    overlay.show("Break's over! Get back to work, slacker.", "angry", "roast")
+                    overlay.start_dialogue()
+            
+            scheduler.start_pomodoro(
+                work_mins=work_mins,
+                on_work_end=_on_work_end,
+                on_break_end=_on_break_end,
+            )
+            if overlay:
+                overlay.show(
+                    f"Pomodoro started! {work_mins:.0f} minutes of focus. I'm watching you.",
+                    "smug", "commentary",
+                )
+                overlay.start_dialogue()
+                time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                overlay.end_dialogue()
+            return
+        return
+
+    # ─── Command: Media Control ───────────────────────────────
+    if any(kw in q_lower for kw in ["pause", "play", "resume", "mute", "next track", "skip", "volume"]):
+        action_key = _resolve_action_key(q_lower)
+        if action_key:
+            action_desc = system_actions.ACTION_REGISTRY[action_key][1]
+            if overlay:
+                overlay.show(
+                    f"Hmph, fine. I'm going to {action_desc}.",
+                    "smug", "commentary",
+                )
+                overlay.start_dialogue()
+            # Execute with countdown (announce was just shown)
+            system_actions.execute_action_async(action_key, overlay)
+            return
+        return
+
+    # ─── Command: Cancel Timer ────────────────────────────────
+    if any(kw in q_lower for kw in ["cancel timer", "stop timer", "cancel reminder"]):
+        if scheduler:
+            timers = scheduler.get_active_timers()
+            if timers:
+                # Cancel the most recent user timer
+                for label_str in timers:
+                    label = label_str.split(" (in")[0]  # strip the time part
+                    if "User timer" in label or "Reminder" in label:
+                        scheduler.cancel_timer(label)
+                        if overlay:
+                            overlay.show("Timer cancelled. You're welcome.", "neutral", "commentary")
+                            overlay.start_dialogue()
+                            time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                            overlay.end_dialogue()
+                        return
+            if overlay:
+                overlay.show("There are no active timers to cancel.", "neutral", "commentary")
+                overlay.start_dialogue()
+                time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+                overlay.end_dialogue()
+            return
+        return
+
+    # ─── Command: Daily Report ────────────────────────────────
+    if any(kw in q_lower for kw in ["daily report", "how did i do", "productivity", "focus score", "report"]):
+        report = memory.get_daily_report()
+        log_main.info(f"Daily Report:\n{report}")
+        # Save to file
+        import os
+        report_dir = os.path.join("training_data", "daily_reports")
+        os.makedirs(report_dir, exist_ok=True)
+        from datetime import datetime
+        report_file = os.path.join(report_dir, f"report_{datetime.now().strftime('%Y%m%d_%H%M')}.md")
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(report)
+        # Show summary
+        score_pct = f"{memory.focus_score:.0%}"
+        if overlay:
+            overlay.show(
+                f"Your focus score today: {score_pct}. Productive: {memory.productive_minutes:.0f}min, Distracted: {memory.unproductive_minutes:.0f}min. Report saved.",
+                "smug", "commentary",
+            )
+            overlay.start_dialogue()
+            time.sleep(config.OVERLAY_DISPLAY_SECONDS)
+            overlay.end_dialogue()
+        return
+
+    # ─── Default: Standard Q&A ────────────────────────────────
     try:
         with log_main.timed("Screenshot for Q&A"):
             image = capture_screen()
@@ -511,11 +811,9 @@ def _handle_user_question(question: str, overlay, memory):
             overlay.show("Ugh, I can't even see your screen right now! Try again.", "angry", "roast")
         return
 
-    # Get system context
     with log_main.timed("System context for Q&A"):
         system_context = get_system_context()
 
-    # Send to local model with the question
     result = answer_user_question(
         question=question,
         image=image,
@@ -532,13 +830,17 @@ def _handle_user_question(question: str, overlay, memory):
             )
         return
 
+    _speak_result(result, overlay, memory)
+
+
+def _speak_result(result: dict, overlay, memory):
+    """Display + speak a result dict (shared by Q&A and summarize)."""
     dialogue = result["dialogue"]
     emotion = result.get("emotion", "neutral")
     action_type = result.get("action_type", "commentary")
 
     print(f"\n  {CYAN}{BOLD}💬 [Q&A] \"{dialogue}\"{RESET}")
 
-    # Display + speak
     if overlay:
         overlay.show(
             dialogue=dialogue,
@@ -550,10 +852,31 @@ def _handle_user_question(question: str, overlay, memory):
     tts_thread = threading.Thread(
         target=_tts_worker,
         args=(dialogue, action_type),
+        kwargs={"overlay_ref": overlay},
         daemon=True,
     )
     tts_thread.start()
     log_main.debug("Q&A TTS thread dispatched")
+
+
+def _extract_minutes(text: str) -> float | None:
+    """Extract a number of minutes from a natural language string."""
+    import re
+    # "30 minutes", "30 mins", "30 min", just "30"
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:minute|min|m\b)', text)
+    if m:
+        return float(m.group(1))
+    # "1 hour", "2 hours"
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:hour|hr|h\b)', text)
+    if m:
+        return float(m.group(1)) * 60
+    # Just a bare number
+    m = re.search(r'(\d+)', text)
+    if m:
+        val = float(m.group(1))
+        if val > 0:
+            return val
+    return None
 
 
 if __name__ == "__main__":
